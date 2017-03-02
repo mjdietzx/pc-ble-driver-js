@@ -43,62 +43,81 @@ const EventEmitter = require('events');
 const _ = require('underscore');
 
 const AdapterState = require('./adapterState');
-const Device = require('./device');
-const Service = require('./service');
 const Characteristic = require('./characteristic');
 const Descriptor = require('./descriptor');
+const Device = require('./device');
+const Security = require('./security');
+const Service = require('./service');
+
 const AdType = require('./util/adType');
 const Converter = require('./util/sdConv');
-const ToText = require('./util/toText');
-const logLevel = require('./util/logLevel');
-const Security = require('./security');
 const HexConv = require('./util/hexConv');
+const logLevel = require('./util/logLevel');
+const ToText = require('./util/toText');
 
-/**
- * Class to mediate error conditions.
- */
+/** Class to mediate error conditions. */
 class Error {
+    /**
+     * Create an error object.
+     *
+     * @constructor
+     * @param {string} userMessage The message to display to the user.
+     * @param {string} description A detailed description of the error.
+     */
     constructor(userMessage, description) {
-        /**
-         * @type {Object}
-         * @property {string} message - Message to show to user
-         * @property {string} description - A detailed description of the error
-         */
+        description = typeof description !== 'undefined' ? description : '';
+
         this.message = userMessage;
         this.description = description;
     }
 }
 
-const _makeError = function (userMessage, description) {
-    return new Error(userMessage, description);
-};
+const _makeError = (userMessage, description) => new Error(userMessage, description);
+const _isCallback = callback => callback && (typeof callback === 'function');
 
+/**
+ * Class representing a transport adapter (SoftDevice RPC module).
+ */
 class Adapter extends EventEmitter {
     /**
-     * Create an adapter, this constructor is used by the AdapterFactory and should not be necessary for the developer to use
-     * @param {object} bleDriver - The driver to use for getting constants from the pc-ble-driver-js AddOn
-     * @param {object} adapter - The adapter to use. The adapter is an object received from the pc-ble-driver-js AddOn
-     * @param {string} instanceId - A unique id that represents this Adapter instance
-     * @param {string} port - The port this adapter uses. For example it can be COM1, /dev/ttyUSB0 or similar
-     * @param {string} notSupportedMessage - Message given to developer if the adapter is not supported on this platform.
+     * @summary Create an object representing an adapter.
      *
-     * @emits {Error} Emitted when error occurs
+     * This constructor is called by `AdapterFactory` and it should not be necessary for the developer to call directly.
      *
+     * @constructor
+     * @param {Object} bleDriver The driver to use for getting constants from the pc-ble-driver-js AddOn.
+     * @param {Object} adapter The adapter to use. The adapter is an object received from the pc-ble-driver-js AddOn.
+     * @param {string} instanceId The unique Id that identifies this Adapter instance.
+     * @param {string} port The port this adapter uses. For example it can be 'COM1', '/dev/ttyUSB0' or similar.
+     * @param {string} serialNumber The serial number of hardware device this adapter is controlling via serial.
+     * @param {string} notSupportedMessage Message displayed to developer if this adapter is not supported on platform.
+     *
+     * @fires {} Emits events. TODO
+     * @throws {Error} Thrown when an error occurs.
      */
     constructor(bleDriver, adapter, instanceId, port, serialNumber, notSupportedMessage) {
         super();
 
-        if (bleDriver === undefined) throw new Error('Missing argument bleDriver.');
-        if (adapter === undefined) throw new Error('Missing argument adapter.');
-        if (instanceId === undefined) throw new Error('Missing argument instanceId.');
-        if (port === undefined) throw new Error('Missing argument port.');
+        if (adapter === undefined) {
+            throw _makeError('Missing argument adapter.');
+        }
+        if (bleDriver === undefined) {
+            throw _makeError('Missing argument bleDriver.');
+        }
+        if (instanceId === undefined) {
+            throw _makeError('Missing argument instanceId.');
+        }
+        if (port === undefined) {
+            throw _makeError('Missing argument port.');
+        }
 
-        this._bleDriver = bleDriver;
         this._adapter = adapter;
+        this._bleDriver = bleDriver;
         this._instanceId = instanceId;
+        this._notSupportedMessage = notSupportedMessage;
+
         this._state = new AdapterState(instanceId, port, serialNumber);
         this._security = new Security(this._bleDriver);
-        this._notSupportedMessage = notSupportedMessage;
 
         this._keys = null;
         this._attMtuMap = {};
@@ -120,6 +139,87 @@ class Adapter extends EventEmitter {
         this._preparedWritesMap = {};
 
         this._pendingNotificationsAndIndications = {};
+
+        this._defaultAdapterOpenOptions = {
+            baudRate: 115200,
+            parity: 'none',
+            flowControl: 'none',
+            eventInterval: 0,
+            logLevel: 'info',
+            retransmissionInterval: 100,
+            responseTimeout: 750,
+            enableBLE: true,
+        };
+
+        this._defaultBleOptions = {
+            gap_enable_params: {
+                periph_conn_count: 1,
+                central_conn_count: 7,
+                central_sec_count: 1,
+            },
+            gatts_enable_params: {
+                service_changed: false,
+                attr_tab_size: this._bleDriver.BLE_GATTS_ATTR_TAB_SIZE_DEFAULT,
+            },
+            common_enable_params: {
+                conn_bw_counts: null, // tell SoftDevice to use default
+                vs_uuid_count: 10,
+            },
+            gatt_enable_params: {
+                att_mtu: 247, // 247 is max att mtu size
+            },
+        };
+    }
+
+    _emitError(err, userMessage) {
+        const error = _makeError(userMessage, err);
+        this.emit('error', error);
+    }
+
+    // returns `true` if an error occurred, `false` otherwise
+    _checkAndPropagateError(err, userMessage, callback) {
+        if (err) {
+            this._emitError(err, userMessage);
+            if (_isCallback(callback)) {
+                callback(err);
+            }
+        }
+
+        return (err && typeof err !== 'undefined');
+    }
+
+    _getDeviceByIdAndPropagateError(deviceInstanceId, errorStr, callback) {
+        const device = this.getDevice(deviceInstanceId);
+
+        if (!device) {
+            const error = _makeError(errorStr, `Failed to find device with Id: ${deviceInstanceId}.`);
+
+            this.emit('error', error);
+            if (_isCallback(callback)) {
+                callback(error);
+            }
+        }
+
+        return device;
+    }
+
+    _changeState(changingStates, swallowEmit) {
+        swallowEmit = typeof swallowEmit !== 'undefined' ? swallowEmit : false;
+        let changed = false;
+
+        Object.keys(changingStates).forEach(state => {
+            const previousValue = this._state[state];
+            const newValue = changingStates[state];
+
+            if (!_.isEqual(previousValue, newValue)) {
+                this._state[state] = newValue;
+                changed = true;
+            }
+        });
+
+        if (!swallowEmit && changed) {
+            this.emit('stateChanged', this._state);
+        }
     }
 
     _getServiceType(service) {
@@ -131,38 +231,43 @@ class Adapter extends EventEmitter {
             } else if (service.type === 'secondary') {
                 type = this._bleDriver.BLE_GATTS_SRVC_TYPE_SECONDARY;
             } else {
-                throw new Error(`Service type ${service.type} is unknown to me. Must be 'primary' or 'secondary'.`);
+                throw _makeError(`Unknown service type: '${service.type}'. Must be 'primary' or 'secondary'.`);
             }
         } else {
-            throw new Error('Service type is not specified. Must be \'primary\' or \'secondary\'.');
+            throw _makeError('Service type is not specified. Must be \'primary\' or \'secondary\'.');
         }
 
         return type;
     }
 
     /**
-     * Get the instaniceId for this Adapter
-     * @return {string} unique id for this Adapter
+     * Get the instanceId of this adapter.
+     * @returns {string} Unique Id of this adapter.
      */
     get instanceId() {
         return this._instanceId;
     }
 
     /**
-     * Get the state for this Adapter.
-     * @return {AdapterState} AdapterState for this Adapter.
+     * Get the state of this adapter. @ref: ./adapterState.js
+     * @returns {AdapterState} `AdapterState` store object of this adapter.
      */
     get state() {
         return this._state;
     }
 
     /**
-     * Get the driver for this adapter
+     * Get the driver of this adapter.
+     * @returns {Object} The pc-ble-driver to use for this adapter, from the pc-ble-driver-js add-on.
      */
     get driver() {
         return this._bleDriver;
     }
 
+    /**
+     * Get the `notSupportedMessage` of this adapter.
+     * @returns {string} The error message thrown if this adapter is not supported on the platform/hardware.
+     */
     get notSupportedMessage() {
         return this._notSupportedMessage;
     }
@@ -179,204 +284,198 @@ class Adapter extends EventEmitter {
         return this.getCurrentAttMtu(deviceInstanceId) - 5;
     }
 
-     _generateKeyPair() {
+    _generateKeyPair() {
         if (this._keys === null) {
             this._keys = this._security.generateKeyPair();
         }
     }
 
+    /**
+     * Compute shared secret.
+     *
+     * @param {string} peerPublicKey Optional peer public key.
+     * @returns {string} The computed shared secret generated from this adapter's key-pair.
+     */
     computeSharedSecret(peerPublicKey) {
         this._generateKeyPair();
-
-        let publicKey = peerPublicKey;
-
-        if (publicKey === null || publicKey === undefined) {
-            publicKey = this._keys;
-        }
-
+        const publicKey = typeof peerPublicKey !== 'undefined' ? peerPublicKey : this._keys;
         return this._security.generateSharedSecret(this._keys.sk, publicKey.pk).ss;
     }
 
+    /**
+     * Compute public key.
+     *
+     * @returns {string} The public key generated from this adapter's key-pair.
+     */
     computePublicKey() {
         this._generateKeyPair();
         return this._security.generatePublicKey(this._keys.sk).pk;
     }
 
+    /**
+     * Sets this adapter's `_keys` property to null. `this._generateKeyPair()` will generate a new key-pair now.
+     * @returns {void}
+     */
     deleteKeys() {
         this._keys = null;
     }
 
-    _checkAndPropagateError(err, userMessage, callback) {
-        if (err) {
-            this._emitError(err, userMessage);
-            if (callback) callback(err);
-            return true;
-        }
+    /**
+     * @summary Initialize the adapter.
+     *
+     * The serial port will be attempted to be opened with the configured serial port settings in `adapterOptions`.
+     * Available adapter open options:
+     * - {number} baudRate: The baud rate this adapter's serial port should be configured with.
+     * - {string} parity: The parity this adapter's serial port should be configured with.
+     * - {string} flowControl: Whether flow control should be configured with this adapter's serial port.
+     * - {number} eventInterval: Interval to use for sending BLE driver events to JavaScript.
+     *                           If 0 events will be sent as soon as they are received from the BLE driver.
+     * - {string} logLevel: The verbosity of logging the developer wants with this adapter.
+     * - {number} retransmissionInterval:
+     * - {number} responseTimeout: Response timeout of the data link layer.
+     * - {boolean} enableBLE: Whether the BLE stack should be initialized and enabled.
+     * @param {AdapterOpenOptions} adapterOptions Options to initialize/open this adapter with.
+     *
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
+    open(adapterOptions, callback) {
+        adapterOptions = typeof adapterOptions !== 'undefined' ? adapterOptions : this._defaultAdapterOpenOptions;
 
-        return false;
-    }
-
-    _emitError(err, userMessage) {
-        const error = new Error(userMessage, err);
-        this.emit('error', error);
-    }
-
-    _changeState(changingStates, swallowEmit) {
-        let changed = false;
-
-        for (const state in changingStates) {
-            const newValue = changingStates[state];
-            const previousValue = this._state[state];
-
-            // Use isEqual to compare objects
-            if (!_.isEqual(previousValue, newValue)) {
-                this._state[state] = newValue;
-                changed = true;
-            }
-        }
-
-        if (swallowEmit) {
-            return;
-        }
-
-        if (changed) {
-            this.emit('stateChanged', this._state);
-        }
-    }
-
-    // Callback signature function(err) {}
-    open(options, callback) {
-        if (this.notSupportedMessage !== undefined) {
-            const error = new Error(this.notSupportedMessage);
+        if (typeof this.notSupportedMessage !== 'undefined') {
+            const error = _makeError(this.notSupportedMessage);
             this.emit('warning', error);
         }
 
-        if (!options) {
-            options = {
-                baudRate: 115200,
-                parity: 'none',
-                flowControl: 'none',
-                eventInterval: 0,
-                logLevel: 'info',
-                retransmissionInterval: 100,
-                responseTimeout: 750,
-                enableBLE: true,
-            };
-        } else {
-            if (!options.baudRate) options.baudRate = 115200;
-            if (!options.parity) options.parity = 'none';
-            if (!options.flowControl) options.flowControl = 'none';
-            if (!options.eventInterval) options.eventInterval = 0;
-            if (!options.logLevel) options.logLevel = 'info';
-            if (!options.retransmissionInterval) options.retransmissionInterval = 100;
-            if (!options.responseTimeout) options.responseTimeout = 750;
-            if (options.enableBLE === undefined) options.enableBLE = true;
-        }
+        Object.keys(this._defaultAdapterOpenOptions).forEach(option => {
+            if (typeof adapterOptions[option] === 'undefined') {
+                adapterOptions[option] = this._defaultAdapterOpenOptions[option];
+            }
+        });
 
-        this._changeState({ baudRate: options.baudRate, parity: options.parity, flowControl: options.flowControl });
+        this._changeState({
+            baudRate: adapterOptions.baudRate,
+            parity: adapterOptions.parity,
+            flowControl: adapterOptions.flowControl,
+        });
 
-        options.logCallback = this._logCallback.bind(this);
-        options.eventCallback = this._eventCallback.bind(this);
-        options.statusCallback = this._statusCallback.bind(this);
+        adapterOptions.eventCallback = this._eventCallback.bind(this);
+        adapterOptions.logCallback = this._logCallback.bind(this);
+        adapterOptions.statusCallback = this._statusCallback.bind(this);
 
-        this._adapter.open(this._state.port, options, err => {
-            if (this._checkAndPropagateError(err, 'Error occurred opening serial port.', callback)) { return; }
+        this._adapter.open(this._state.port, adapterOptions, err => {
+            if (this._checkAndPropagateError(err, 'Error occurred opening serial port.', callback)) {
+                return;
+            }
 
             this._changeState({ available: true });
             this.emit('opened', this);
 
-            if (options.enableBLE) {
+            if (adapterOptions.enableBLE) {
                 this.getState(getStateError => {
-                    if (this._checkAndPropagateError(getStateError, 'Error retrieving adapter state.', callback)) { return; }
-                });
-            }
+                    if (this._checkAndPropagateError(getStateError, 'Error retrieving adapter state.', callback)) {
+                        return;
+                    }
 
-            if (callback) { callback(); }
+                    if (_isCallback(callback)) {
+                        callback();
+                    }
+                });
+            } else if (_isCallback(callback)) {
+                callback();
+            }
         });
     }
 
     /**
-     * Close Adapter communication and free resources related to the Adapter. The event listeners added to the Adapter are removed.
+     * @summary Close the adapter.
+     *
+     * This function will close the serial port, release allocated resources and remove event listeners.
+     *
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
      */
     close(callback) {
         this._changeState({ available: false });
-        this._adapter.close(error => {
+        this._adapter.close(err => {
             this.emit('closed', this);
-            if (callback) callback(error);
+            if (_isCallback(callback)) {
+                callback(err);
+            }
         });
     }
 
+    /**
+     * Get this adapters stats.
+     * @returns {Object} This adapters stats.
+     */
     getStats() {
         return this._adapter.getStats();
     }
 
+    /**
+     * @summary Enable the BLE stack
+     *
+     * This call initializes the BLE stack, no other BLE related function can be called before this one.
+     *
+     * Available BLE enable parameters:
+     * - {Object} gap_enable_params: GAP init parameters
+     *                - {number} periph_conn_count: Number of connections acting as a peripheral.
+     *                - {number} central_conn_count: Number of connections acting as a central.
+     *                - {number} central_sec_count: Number of SMP instances for all connections acting as a central..
+     * - {Object} gatts_enable_params: GATTS init parameters
+     *                - {boolean} service_changed: Include the Service Changed characteristic in the Attribute Table.
+     *                - {number} attr_tab_size: Attribute Table size in bytes. The size must be a multiple of 4.
+     * - {Object} common_enable_params: Common init parameters
+     *                - {null|number} conn_bw_counts: Bandwidth configuration parameters or null for defaults.
+     *                - {number} vs_uuid_count: Maximum number of 128-bit, Vendor Specific UUID bases to allocate.
+     * - {Object} gatt_enable_params: GATT init parameters
+     *                - {number} att_mtu: Maximum size of ATT packet the SoftDevice can send or receive.
+     *                                    If it is 0 then @ref GATT_MTU_SIZE_DEFAULT will be used.
+     *                                    Otherwise @ref GATT_MTU_SIZE_DEFAULT is the minimum value.
+     * @param {Object} options BLE Initialization parameters.
+     *
+     * @param {function} callback Callback signature: (err, parameters, app_ram_base) => {}.
+     * @returns {void}
+     */
     enableBLE(options, callback) {
-        if (options === undefined || options === null) {
-            options = {
-                gap_enable_params: {
-                    periph_conn_count: 1,
-                    central_conn_count: 7,
-                    central_sec_count: 1,
-                },
-                gatts_enable_params: {
-                    service_changed: false,
-                    attr_tab_size: this._bleDriver.BLE_GATTS_ATTR_TAB_SIZE_DEFAULT,
-                },
-                common_enable_params: {
-                    conn_bw_counts: null, // tell SD to use default
-                    vs_uuid_count: 10,
-                },
-                gatt_enable_params: {
-                    att_mtu: 247, // 247 is max att mtu size
-                },
-            };
-        }
+        options = typeof options !== 'undefined' ? options : this._defaultBleOptions;
 
-        this._adapter.enableBLE(
-            options,
-            (err, parameters, app_ram_base) => {
-                if (this._checkAndPropagateError(err, 'Enabling BLE failed.', callback)) { return; }
-
-                if (callback) {
-                    callback(err, parameters, app_ram_base);
+        this._adapter.enableBLE(options, (err, parameters, appRamBase) => {
+            if (!this._checkAndPropagateError(err, 'Enabling BLE failed.', callback)) {
+                if (_isCallback(callback)) {
+                    callback(err, parameters, appRamBase);
                 }
-            });
-    }
-
-    _statusCallback(status) {
-        switch (status.id) {
-            case this._bleDriver.RESET_PERFORMED:
-                this._init();
-                this._changeState(
-                    {
-                        available: false,
-                        connecting: false,
-                        scanning: false,
-                        advertising: false,
-                    }
-                );
-                break;
-            case this._bleDriver.CONNECTION_ACTIVE:
-                this._changeState(
-                    {
-                        available: true,
-                    }
-                );
-                break;
-        }
-
-        this.emit('status', status);
+            }
+        });
     }
 
     _logCallback(severity, message) {
         this.emit('logMessage', severity, message);
     }
 
+    _statusCallback(status) {
+        switch (status.id) {
+            case this._bleDriver.RESET_PERFORMED:
+                this._init();
+                this._changeState({ available: false, connecting: false, scanning: false, advertising: false });
+                break;
+            case this._bleDriver.CONNECTION_ACTIVE:
+                this._changeState({ available: true });
+                break;
+            default:
+                this._logCallback('warning', 'Un-known status Id received.');
+        }
+
+        this.emit('status', status);
+    }
+
     _eventCallback(eventArray) {
         eventArray.forEach(event => {
             const text = new ToText(event);
-            // TODO: set the correct level for different types of events:
-            this.emit('logMessage', logLevel.DEBUG, text.toString());
+
+            // TODO: set the correct log level for different types of events
+            this._logCallback(logLevel.DEBUG, `${text}`);
 
             switch (event.id) {
                 case this._bleDriver.BLE_GAP_EVT_CONNECTED:
@@ -428,13 +527,13 @@ class Adapter extends EventEmitter {
                     this._parseGapConnectionParameterUpdateRequestEvent(event);
                     break;
                 case this._bleDriver.BLE_GAP_EVT_SCAN_REQ_REPORT:
-                    // Not needed. Received when a scan request is received.
+                    // Not needed, received when a scan request is received.
                     break;
                 case this._bleDriver.BLE_GATTC_EVT_PRIM_SRVC_DISC_RSP:
                     this._parseGattcPrimaryServiceDiscoveryResponseEvent(event);
                     break;
                 case this._bleDriver.BLE_GATTC_EVT_REL_DISC_RSP:
-                    // Not needed. Used for included services discovery.
+                    // Not needed, used for included services discovery.
                     break;
                 case this._bleDriver.BLE_GATTC_EVT_CHAR_DISC_RSP:
                     this._parseGattcCharacteristicDiscoveryResponseEvent(event);
@@ -494,20 +593,17 @@ class Adapter extends EventEmitter {
                     this._parseDataLengthChangedEvent(event);
                     break;
                 default:
-                    this.emit('logMessage', logLevel.INFO, `Unsupported event received from SoftDevice: ${event.id} - ${event.name}`);
-                    break;
+                    this._logCallback(logLevel.INFO,
+                                      `Unsupported event received from the SoftDevice: ${event.id} - ${event.name}`);
             }
         });
     }
 
     _parseConnectedEvent(event) {
-        // TODO: Update device with connection handle
-        // TODO: Should 'deviceConnected' event emit the updated device?
         const deviceAddress = event.peer_addr;
         const connectionParameters = event.conn_params;
-        let deviceRole;
 
-        // If our role is central set the device role to be peripheral.
+        let deviceRole;
         if (event.role === 'BLE_GAP_ROLE_CENTRAL') {
             deviceRole = 'peripheral';
         } else if (event.role === 'BLE_GAP_ROLE_PERIPH') {
@@ -515,65 +611,67 @@ class Adapter extends EventEmitter {
         }
 
         const device = new Device(deviceAddress, deviceRole);
-
         device.connectionHandle = event.conn_handle;
         device.minConnectionInterval = connectionParameters.min_conn_interval;
         device.maxConnectionInterval = connectionParameters.max_conn_interval;
         device.slaveLatency = connectionParameters.slave_latency;
         device.connectionSupervisionTimeout = connectionParameters.conn_sup_timeout;
-
         device.connected = true;
-        this._devices[device.instanceId] = device;
 
+        this._devices[device.instanceId] = device;
         this._attMtuMap[device.instanceId] = this.driver.GATT_MTU_SIZE_DEFAULT;
 
         this._changeState({ connecting: false });
 
         if (deviceRole === 'central') {
             this._changeState({ advertising: false });
+        } else if (deviceRole === 'peripheral') {
+            const callback = this._gapOperationsMap.connecting.callback;
+            delete this._gapOperationsMap.connecting;
+
+            if (_isCallback(callback)) {
+                callback(undefined, device);
+            }
         }
 
         this.emit('deviceConnected', device);
-
         this._addDeviceToAllPerConnectionValues(device.instanceId);
+    }
 
-        if (deviceRole === 'peripheral') {
-            const callback = this._gapOperationsMap.connecting.callback;
-            delete this._gapOperationsMap.connecting;
-            if (callback) { callback(undefined, device); }
-        }
+    _deviceNotFound(connHandle, specificError) {
+        const errorMessage = `Internal inconsistency: could not find device with connection handle: ${connHandle}.`;
+        this._emitError(errorMessage, `${specificError}`);
     }
 
     _parseDisconnectedEvent(event) {
         const device = this._getDeviceByConnectionHandle(event.conn_handle);
         if (!device) {
-            this._emitError('Internal inconsistency: Could not find device with connection handle ' + event.conn_handle, 'Disconnect failed');
-            const errorObject = _makeError('Disconnect failed', 'Internal inconsistency: Could not find device with connection handle ' + event.conn_handle);
-
-            // cannot reach callback when there is no device. The best we can do is emit error and return.
-            this.emit('error', errorObject);
+            this._deviceNotFound(event.conn_handle, 'Disconnect failed.');
             return;
         }
 
         device.connected = false;
-
-        if (device.instanceId in this._attMtuMap) delete this._attMtuMap[device.instanceId];
+        if (this._attMtuMap[device.instanceId]) {
+            delete this._attMtuMap[device.instanceId];
+        }
 
         // TODO: Delete all operations for this device.
-
+        // TODO: How do we know what the callback expects? Check disconnected event reason?
         if (this._gapOperationsMap[device.instanceId]) {
-            // TODO: How do we know what the callback expects? Check disconnected event reason?
             const callback = this._gapOperationsMap[device.instanceId].callback;
             delete this._gapOperationsMap[device.instanceId];
-            if (callback) { callback(undefined, device); }
+
+            if (_isCallback(callback)) {
+                callback(undefined, device);
+            }
         }
 
         if (this._gattOperationsMap[device.instanceId]) {
             const callback = this._gattOperationsMap[device.instanceId].callback;
             delete this._gattOperationsMap[device.instanceId];
 
-            if (callback) {
-                callback(_makeError('Device disconnected', 'Device with address ' + device.address + ' disconnected'));
+            if (_isCallback(callback)) {
+                callback(_makeError('Device disconnected.', `Device with address: ${device.address} disconnected.`));
             }
         }
 
@@ -586,21 +684,9 @@ class Adapter extends EventEmitter {
 
     _parseConnectionParameterUpdateEvent(event) {
         const device = this._getDeviceByConnectionHandle(event.conn_handle);
-
         if (!device) {
-            this.emit('error', 'Internal inconsistency: Could not find device with connection handle ' + event.conn_handle);
+            this._deviceNotFound(event.conn_handle, 'Connection parameter update failed.');
             return;
-        }
-
-        device.minConnectionInterval = event.conn_params.min_conn_interval;
-        device.maxConnectionInterval = event.conn_params.max_conn_interval;
-        device.slaveLatency = event.conn_params.slave_latency;
-        device.connectionSupervisionTimeout = event.conn_params.conn_sup_timeout;
-
-        if (this._gapOperationsMap[device.instanceId]) {
-            const callback = this._gapOperationsMap[device.instanceId].callback;
-            delete this._gapOperationsMap[device.instanceId];
-            if (callback) { callback(undefined, device); }
         }
 
         const connectionParameters = {
@@ -610,12 +696,26 @@ class Adapter extends EventEmitter {
             connectionSupervisionTimeout: event.conn_params.conn_sup_timeout,
         };
 
+        Object.keys(connectionParameters).forEach(connParam => {
+            device[connParam] = connectionParameters[connParam];
+        });
+
+        if (this._gapOperationsMap[device.instanceId]) {
+            const callback = this._gapOperationsMap[device.instanceId].callback;
+            delete this._gapOperationsMap[device.instanceId];
+
+            if (_isCallback(callback)) {
+                callback(undefined, device);
+            }
+        }
+
         this.emit('connParamUpdate', device, connectionParameters);
     }
 
+    // TODO: should we check `device` is found for all events?
+
     _parseSecParamsRequestEvent(event) {
         const device = this._getDeviceByConnectionHandle(event.conn_handle);
-
         this.emit('secParamsRequest', device, event.peer_params);
     }
 
@@ -627,7 +727,6 @@ class Adapter extends EventEmitter {
             securityMode: event.conn_sec.sec_mode.sm,
             securityLevel: event.conn_sec.sec_mode.lv,
         };
-
         this.emit('securityChanged', device, authParamters);
     }
 
@@ -635,21 +734,18 @@ class Adapter extends EventEmitter {
         const device = this._getDeviceByConnectionHandle(event.conn_handle);
         device.ownPeriphInitiatedPairingPending = false;
 
-        this.emit('authStatus',
-            device,
-            {
-                auth_status: event.auth_status,
-                auth_status_name: event.auth_status_name,
-                error_src: event.error_src,
-                error_src_name: event.error_src_name,
-                bonded: event.bonded,
-                sm1_levels: event.sm1_levels,
-                sm2_levels: event.sm2_levels,
-                kdist_own: event.kdist_own,
-                kdist_peer: event.kdist_peer,
-                keyset: event.keyset,
-            }
-        );
+        this.emit('authStatus', device, {
+            auth_status: event.auth_status,
+            auth_status_name: event.auth_status_name,
+            error_src: event.error_src,
+            error_src_name: event.error_src_name,
+            bonded: event.bonded,
+            sm1_levels: event.sm1_levels,
+            sm2_levels: event.sm2_levels,
+            kdist_own: event.kdist_own,
+            kdist_peer: event.kdist_peer,
+            keyset: event.keyset,
+        });
     }
 
     _parsePasskeyDisplayEvent(event) {
@@ -669,19 +765,16 @@ class Adapter extends EventEmitter {
 
     _parseLescDhkeyRequest(event) {
         const device = this._getDeviceByConnectionHandle(event.conn_handle);
-
         this.emit('lescDhkeyRequest', device, event.pk_peer, event.oobd_req);
     }
 
     _parseSecInfoRequest(event) {
         const device = this._getDeviceByConnectionHandle(event.conn_handle);
-
         this.emit('secInfoRequest', device, event);
     }
 
     _parseGapSecurityRequestEvent(event) {
         const device = this._getDeviceByConnectionHandle(event.conn_handle);
-
         this.emit('securityRequest', device, event);
     }
 
@@ -701,6 +794,7 @@ class Adapter extends EventEmitter {
     _parseGapAdvertismentReportEvent(event) {
         const address = event.peer_addr;
         const discoveredDevice = new Device(address, 'peripheral');
+
         discoveredDevice.processEventData(event);
         this.emit('deviceDiscovered', discoveredDevice);
     }
@@ -715,20 +809,24 @@ class Adapter extends EventEmitter {
                 this._changeState({ scanning: false });
                 this.emit('scanTimedOut');
                 break;
-            case this._bleDriver.BLE_GAP_TIMEOUT_SRC_CONN:
+            case this._bleDriver.BLE_GAP_TIMEOUT_SRC_CONN: {
                 const deviceAddress = this._gapOperationsMap.connecting.deviceAddress;
                 const callback = this._gapOperationsMap.connecting.callback;
                 const errorObject = _makeError('Could not connect. Connection procedure timed out.');
-                if (callback) callback(errorObject);
+                if (_isCallback(callback)) {
+                    callback(errorObject);
+                }
                 delete this._gapOperationsMap.connecting;
                 this._changeState({ connecting: false });
                 this.emit('connectTimedOut', deviceAddress);
                 break;
-            case this._bleDriver.BLE_GAP_TIMEOUT_SRC_SECURITY_REQUEST:
+            }
+            case this._bleDriver.BLE_GAP_TIMEOUT_SRC_SECURITY_REQUEST: {
                 const device = this._getDeviceByConnectionHandle(event.conn_handle);
                 this.emit('securityRequestTimedOut', device);
-                this.emit('error', _makeError('Security request timed out.'));
+                this._emitError('Security request timed out.');
                 break;
+            }
             default:
                 console.log(`GAP operation timed out: ${event.src_name} (${event.src}).`);
         }
@@ -739,7 +837,7 @@ class Adapter extends EventEmitter {
         device.rssi = event.rssi;
 
         // TODO: How do we notify the application of a changed rssi?
-        //emit('rssiChanged', device);
+        // emit('rssiChanged', device);
     }
 
     _parseGattcPrimaryServiceDiscoveryResponseEvent(event) {
@@ -752,27 +850,34 @@ class Adapter extends EventEmitter {
                 // No pending reads to wait for.
                 const callbackServices = [];
 
-                for (let serviceInstanceId in this._services) {
-                    const service = this._services[serviceInstanceId];
-                    if (service.deviceInstanceId === gattOperation.parent.instanceId) {
-                        callbackServices.push(this._services[serviceInstanceId]);
+                for (const serviceInstanceId in this._services) {
+                    if (Object.prototype.hasOwnProperty.call(this._services, serviceInstanceId) ||
+                        {}.hasOwnProperty.call(this._services, serviceInstanceId)) {
+                        const service = this._services[serviceInstanceId];
+                        if (service.deviceInstanceId === gattOperation.parent.instanceId) {
+                            callbackServices.push(this._services[serviceInstanceId]);
+                        }
                     }
                 }
 
                 delete this._gattOperationsMap[device.instanceId];
                 gattOperation.callback(undefined, callbackServices);
             } else {
-                for (let handle in gattOperation.pendingHandleReads) {
-                    // Just take the first found handle and start the read process.
-                    const handleAsNumber = parseInt(handle, 10);
-                    this._adapter.gattcRead(device.connectionHandle, handleAsNumber, 0, err => {
-                        if (err) {
-                            this.emit('error', err);
-                            gattOperation.callback(_makeError('Error reading attributes', err));
-                        }
-                    });
+                for (const handle in gattOperation.pendingHandleReads) {
+                    if (Object.prototype.hasOwnProperty.call(gattOperation.pendingHandleReads, handle) ||
+                        {}.hasOwnProperty.call(gattOperation.pendingHandleReads, handle)) {
+                        // Just take the first found handle and start the read process.
+                        const handleAsNumber = parseInt(handle, 10);
 
-                    break;
+                        this._adapter.gattcRead(device.connectionHandle, handleAsNumber, 0, err => {
+                            if (err) {
+                                this.emit('error', err);
+                                gattOperation.callback(_makeError('Error reading attributes', err));
+                            }
+                        });
+
+                        break;
+                    }
                 }
             }
         };
@@ -826,25 +931,29 @@ class Adapter extends EventEmitter {
                 // No pending reads to wait for.
                 const callbackCharacteristics = [];
 
-                for (let characteristicInstanceId in this._characteristics) {
-                    const characteristic = this._characteristics[characteristicInstanceId];
-                    if (characteristic.serviceInstanceId === gattOperation.parent.instanceId) {
-                        callbackCharacteristics.push(characteristic);
+                for (const characteristicInstanceId in this._characteristics) {
+                    if (Object.prototype.hasOwnProperty.call(this._characteristics, characteristicInstanceId) ||
+                        {}.hasOwnProperty.call(this._characteristics, characteristicInstanceId)) {
+                        const characteristic = this._characteristics[characteristicInstanceId];
+                        if (characteristic.serviceInstanceId === gattOperation.parent.instanceId) {
+                            callbackCharacteristics.push(characteristic);
+                        }
                     }
                 }
 
                 delete this._gattOperationsMap[device.instanceId];
                 gattOperation.callback(undefined, callbackCharacteristics);
             } else {
-                for (let handle in gattOperation.pendingHandleReads) {
-                    // Only take the first found handle and start the read process.
-                    const handleAsNumber = parseInt(handle, 10);
-                    this._adapter.gattcRead(device.connectionHandle, handleAsNumber, 0, err => {
-                        if (this._checkAndPropagateError(err, `Failed to get characteristic with handle ${handleAsNumber}`, gattOperation.callback)) {
-                            return;
-                        }
-                    });
-                    break;
+                for (const handle in gattOperation.pendingHandleReads) {
+                    if (Object.prototype.hasOwnProperty.call(gattOperation.pendingHandleReads, handle) ||
+                        {}.hasOwnProperty.call(gattOperation.pendingHandleReads, handle)) {
+                        // Only take the first found handle and start the read process.
+                        const handleAsNumber = parseInt(handle, 10);
+                        this._adapter.gattcRead(device.connectionHandle, handleAsNumber, 0, err => {
+                            this._checkAndPropagateError(err, `Failed to get characteristic with handle ${handleAsNumber}`, gattOperation.callback);
+                        });
+                        break;
+                    }
                 }
             }
         };
@@ -913,28 +1022,34 @@ class Adapter extends EventEmitter {
                 // No pending reads to wait for.
                 const callbackDescriptors = [];
 
-                for (let descriptorInstanceId in this._descriptors) {
-                    const descriptor = this._descriptors[descriptorInstanceId];
-                    if (descriptor.characteristicInstanceId === gattOperation.parent.instanceId) {
-                        callbackDescriptors.push(descriptor);
+                for (const descriptorInstanceId in this._descriptors) {
+                    if (Object.prototype.hasOwnProperty.call(this._descriptors, descriptorInstanceId) ||
+                        {}.hasOwnProperty.call(this._descriptors, descriptorInstanceId)) {
+                        const descriptor = this._descriptors[descriptorInstanceId];
+                        if (descriptor.characteristicInstanceId === gattOperation.parent.instanceId) {
+                            callbackDescriptors.push(descriptor);
+                        }
                     }
                 }
 
                 delete this._gattOperationsMap[device.instanceId];
                 gattOperation.callback(undefined, callbackDescriptors);
             } else {
-                for (let handle in gattOperation.pendingHandleReads) {
-                    const handleAsNumber = parseInt(handle, 10);
+                for (const handle in gattOperation.pendingHandleReads) {
+                    if (Object.prototype.hasOwnProperty.call(gattOperation.pendingHandleReads, handle) ||
+                        {}.hasOwnProperty.call(gattOperation.pendingHandleReads, handle)) {
+                        const handleAsNumber = parseInt(handle, 10);
 
-                    // Just take the first found handle and start the read process.
-                    this._adapter.gattcRead(device.connectionHandle, handleAsNumber, 0, err => {
-                        if (err) {
-                            this.emit('error', err);
+                        // Just take the first found handle and start the read process.
+                        this._adapter.gattcRead(device.connectionHandle, handleAsNumber, 0, err => {
+                            if (err) {
+                                this.emit('error', err);
 
-                            // Call getDescriptors callback??
-                        }
-                    });
-                    break;
+                                // Call getDescriptors callback??
+                            }
+                        });
+                        break;
+                    }
                 }
             }
         };
@@ -1010,7 +1125,7 @@ class Adapter extends EventEmitter {
 
             const addVsUuidToDriver = uuid => {
                 return new Promise((resolve, reject) => {
-                    this._converter.uuidToDriver(uuid, (err, uuid) => {
+                    this._converter.uuidToDriver(uuid, (err, _uuid) => {
                         if (err) {
                             reject(err);
                             return;
@@ -1036,7 +1151,7 @@ class Adapter extends EventEmitter {
 
                 if (_.isEmpty(pendingHandleReads)) {
                     const callbackServices = [];
-                    for (let serviceInstanceId in this._services) {
+                    for (const serviceInstanceId in this._services) {
                         if (this._services[serviceInstanceId].deviceInstanceId === device.instanceId) {
                             callbackServices.push(this._services[serviceInstanceId]);
                         }
@@ -1061,7 +1176,7 @@ class Adapter extends EventEmitter {
                 if (_.isEmpty(pendingHandleReads)) {
                     const callbackCharacteristics = [];
 
-                    for (let characteristicInstanceId in this._characteristics) {
+                    for (const characteristicInstanceId in this._characteristics) {
                         if (this._characteristics[characteristicInstanceId].serviceInstanceId === attribute.serviceInstanceId) {
                             callbackCharacteristics.push(this._characteristics[characteristicInstanceId]);
                         }
@@ -1079,7 +1194,7 @@ class Adapter extends EventEmitter {
 
                 if (_.isEmpty(pendingHandleReads)) {
                     const callbackDescriptors = [];
-                    for (let descriptorInstanceId in this._descriptors) {
+                    for (const descriptorInstanceId in this._descriptors) {
                         if (this._descriptors[descriptorInstanceId].characteristicInstanceId === attribute.characteristicInstanceId) {
                             callbackDescriptors.push(this._descriptors[descriptorInstanceId]);
                         }
@@ -1090,18 +1205,21 @@ class Adapter extends EventEmitter {
                 }
             }
 
-            for (let newReadHandle in pendingHandleReads) {
-                const newReadHandleAsNumber = parseInt(newReadHandle, 10);
+            for (const newReadHandle in pendingHandleReads) {
+                if (Object.prototype.hasOwnProperty.call(pendingHandleReads, newReadHandle) ||
+                    {}.hasOwnProperty.call(pendingHandleReads, newReadHandle)) {
+                    const newReadHandleAsNumber = parseInt(newReadHandle, 10);
 
-                // Just take the first found handle and start the read process.
-                this._adapter.gattcRead(device.connectionHandle, newReadHandleAsNumber, 0, err => {
-                    if (err) {
-                        this.emit('error', err);
+                    // Just take the first found handle and start the read process.
+                    this._adapter.gattcRead(device.connectionHandle, newReadHandleAsNumber, 0, err => {
+                        if (err) {
+                            this.emit('error', err);
 
-                        // Call getAttributecallback callback??
-                    }
-                });
-                break;
+                            // Call getAttributecallback callback??
+                        }
+                    });
+                    break;
+                }
             }
         } else {
             if (event.gatt_status !== this._bleDriver.BLE_GATT_STATUS_SUCCESS) {
@@ -1121,7 +1239,7 @@ class Adapter extends EventEmitter {
                     if (err) {
                         delete this._gattOperationsMap[device.instanceId];
                         this.emit('error', _makeError('Read value failed', err));
-                        gattOperation.callback('Failed reading at byte #' + gattOperation.readBytes.length);
+                        gattOperation.callback(`Failed reading at byte #: ${gattOperation.readBytes.length}.`);
                     }
                 });
             } else {
@@ -1147,19 +1265,19 @@ class Adapter extends EventEmitter {
 
         if (!device) {
             delete this._gattOperationsMap[device.instanceId];
-            this.emit('error', 'Failed to handle write event, no device with handle ' + device.instanceId + 'found.');
-            gattOperation.callback(_makeError('Failed to handle write event, no device with connection handle ' + event.conn_handle + 'found'));
+            const errorStr = `Failed to handle write event, device with connection handle: ${event.conn_handle} not found.`;
+            this.emit('error', errorStr);
+            gattOperation.callback(_makeError(errorStr));
             return;
         }
 
         if (event.write_op === this._bleDriver.BLE_GATT_OP_WRITE_CMD) {
             gattOperation.attribute.value = gattOperation.value;
         } else if (event.write_op === this._bleDriver.BLE_GATT_OP_PREP_WRITE_REQ) {
-
             const writeParameters = {
                 write_op: 0,
                 flags: 0,
-                handle: handle,
+                handle,
                 offset: 0,
                 len: 0,
                 value: [],
@@ -1176,11 +1294,11 @@ class Adapter extends EventEmitter {
                 gattOperation.bytesWritten += value.length;
 
                 this._adapter.gattcWrite(device.connectionHandle, writeParameters, err => {
-
                     if (err) {
                         console.log('some error');
                         this._longWriteCancel(device, gattOperation.attribute);
-                        this.emit('error', _makeError('Failed to write value to device/handle ' + device.instanceId + '/' + handle, err));
+                        this.emit('error', _makeError(`Failed to long write value of device/handle:
+                                                       ${device.instanceId}/${handle}.`, err));
                         return;
                     }
                 });
@@ -1189,11 +1307,10 @@ class Adapter extends EventEmitter {
                 writeParameters.flags = this._bleDriver.BLE_GATT_EXEC_WRITE_FLAG_PREPARED_WRITE;
 
                 this._adapter.gattcWrite(device.connectionHandle, writeParameters, err => {
-
                     if (err) {
                         this._longWriteCancel(device, gattOperation.attribute);
-                        this.emit('error', _makeError('Failed to write value to device/handle ' + device.instanceId + '/' + handle, err));
-                        return;
+                        this.emit('error', _makeError(`Failed to long write value of device/handle: 
+                                                       ${device.instanceId}/'${handle}.`, err));
                     }
                 });
             }
@@ -1217,37 +1334,32 @@ class Adapter extends EventEmitter {
     _getServiceByHandle(deviceInstanceId, handle) {
         let foundService = null;
 
-        for (let serviceInstanceId in this._services) {
+        Object.keys(this._services).forEach(serviceInstanceId => {
             const service = this._services[serviceInstanceId];
-
-            if (!_.isEqual(service.deviceInstanceId, deviceInstanceId)) {
-                continue;
+            if (_.isEqual(service.deviceInstanceId, deviceInstanceId)) {
+                if (service.startHandle <= handle &&
+                    (!foundService || foundService.startHandle <= service.startHandle)) {
+                    foundService = service;
+                }
             }
-
-            if (service.startHandle <= handle && (!foundService || foundService.startHandle <= service.startHandle)) {
-                foundService = service;
-            }
-        }
+        });
 
         return foundService;
     }
 
     _getCharacteristicByHandle(deviceInstanceId, handle) {
         const service = this._getServiceByHandle(deviceInstanceId, handle);
-
         let foundCharacteristic = null;
 
-        for (let characteristicInstanceId in this._characteristics) {
+        Object.keys(this._characteristics).forEach(characteristicInstanceId => {
             const characteristic = this._characteristics[characteristicInstanceId];
-
-            if (characteristic.serviceInstanceId !== service.instanceId) {
-                continue;
+            if (_.isEqual(characteristic.serviceInstanceId, service.instanceId)) {
+                if (characteristic.declarationHandle <= handle &&
+                    (!foundCharacteristic || foundCharacteristic.declarationHandle < characteristic.declarationHandle)) {
+                    foundCharacteristic = characteristic;
+                }
             }
-
-            if (characteristic.declarationHandle <= handle && (!foundCharacteristic || foundCharacteristic.declarationHandle < characteristic.declarationHandle)) {
-                foundCharacteristic = characteristic;
-            }
-        }
+        });
 
         return foundCharacteristic;
     }
@@ -1259,17 +1371,14 @@ class Adapter extends EventEmitter {
     _getDescriptorByHandle(deviceInstanceId, handle) {
         const characteristic = this._getCharacteristicByHandle(deviceInstanceId, handle);
 
-        for (let descriptorInstanceId in this._descriptors) {
+        Object.keys(this._descriptors).forEach(descriptorInstanceId => {
             const descriptor = this._descriptors[descriptorInstanceId];
-
-            if (descriptor.characteristicInstanceId !== characteristic.instanceId) {
-                continue;
+            if (_.isEqual(descriptor.characteristicInstanceId, characteristic.instanceId)) {
+                if (descriptor.handle === handle) {
+                    return descriptor;
+                }
             }
-
-            if (descriptor.handle === handle) {
-                return descriptor;
-            }
-        }
+        });
 
         return null;
     }
@@ -1323,9 +1432,7 @@ class Adapter extends EventEmitter {
         }
 
         if (gattOperation && gattOperation.callback) {
-
             gattOperation.callback(null, newMtu);
-
             delete this._gattOperationsMap[device.instanceId];
         }
     }
@@ -1434,7 +1541,7 @@ class Adapter extends EventEmitter {
                     },
                 };
             } else if (event.write.op === this._bleDriver.BLE_GATTS_OP_EXEC_WRITE_REQ_NOW) {
-                for (let preparedWrite of this._preparedWritesMap[device.instanceId]) {
+                for (const preparedWrite of this._preparedWritesMap[device.instanceId]) {
                     promiseChain = promiseChain.then(() => {
                         createWritePromise(preparedWrite.handle, preparedWrite.value, preparedWrite.offset);
                     });
@@ -1493,7 +1600,7 @@ class Adapter extends EventEmitter {
 
         this.emit('deviceNotifiedOrIndicated', remoteDevice, characteristic);
 
-        this._pendingNotificationsAndIndications.remainingIndicationConfirmations--;
+        this._pendingNotificationsAndIndications.remainingIndicationConfirmations -= 1;
         if (this._sendingNotificationsAndIndicationsComplete()) {
             this._pendingNotificationsAndIndications.completeCallback(undefined, characteristic);
             this._pendingNotificationsAndIndications = {};
@@ -1513,8 +1620,9 @@ class Adapter extends EventEmitter {
             const newMtu = event.client_rx_mtu;
             this._attMtuMap[remoteDevice.instanceId] = newMtu;
 
-            if (newMtu !== previousMtu);
-            this.emit('attMtuChanged', remoteDevice, event.client_rx_mtu);
+            if (newMtu !== previousMtu) {
+                this.emit('attMtuChanged', remoteDevice, event.client_rx_mtu);
+            }
         });
     }
 
@@ -1542,75 +1650,93 @@ class Adapter extends EventEmitter {
         attribute.value = attribute.value.slice(0, offset).concat(value);
     }
 
-    // Callback signature function(err, state) {}
+    /**
+     * Gets and updates this adapter's state.
+     *
+     * @param {function} callback Callback signature: (err, state) => {}.
+     * @returns {void}
+     */
     getState(callback) {
         const changedStates = {};
-
         this._adapter.getVersion((version, err) => {
-            if (this._checkAndPropagateError(
-                err,
-                'Failed to retrieve softdevice firmwareVersion.',
-                callback)) return;
+            if (this._checkAndPropagateError(err, 'Failed to retrieve the SoftDevice\'s firmware version.', callback)) {
+                return;
+            }
 
             changedStates.firmwareVersion = version;
-
             this._adapter.gapGetDeviceName((name, err) => {
-                if (this._checkAndPropagateError(
-                    err,
-                    'Failed to retrieve driver version.',
-                    callback)) return;
+                if (this._checkAndPropagateError(err, 'Failed to retrieve the BLE device\'s name.', callback)) {
+                    return;
+                }
 
                 changedStates.name = name;
-
                 this._adapter.gapGetAddress((address, err) => {
-                    if (this._checkAndPropagateError(
-                        err,
-                        'Failed to retrieve device address.',
-                        callback)) return;
+                    if (this._checkAndPropagateError(err, 'Failed to retrieve the BLE device\'s address.', callback)) {
+                        return;
+                    }
 
                     changedStates.address = address;
                     changedStates.available = true;
-
                     this._changeState(changedStates);
-                    if (callback) { callback(undefined, this._state); }
+
+                    if (_isCallback(callback)) {
+                        callback(undefined, this._state);
+                    }
                 });
             });
         });
     }
 
-    // Set GAP related information
+    /**
+     * Sets this adapter's BLE device's GAP name.
+     *
+     * @param {string} name GAP device name.
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     setName(name, callback) {
-        let _name = name.split();
+        const _name = name.split();
         this._adapter.gapSetDeviceName({ sm: 0, lv: 0 }, _name, err => {
             if (err) {
-                this.emit('error', _makeError('Failed to set name to adapter', err));
+                this.emit('error', _makeError('Failed to set the BLE device\'s GAP name.', err));
             } else if (this._state.name !== name) {
                 this._state.name = name;
-                this._changeState({ name: name });
+                this._changeState({ name });
             }
 
-            if (callback) { callback(err); }
+            if (_isCallback(callback)) {
+                callback(err);
+            }
         });
     }
 
-    _getAddressStruct(address, type) {
-        return { address: address, type: type };
-    }
-
+    /**
+     * @summary Sets this adapter's BLE device's local Bluetooth identity address.
+     *
+     * The local Bluetooth identity address is the address that identifies this device to other peers.
+     * The address type must be either `BLE_GAP_ADDR_TYPE_PUBLIC` or 'BLE_GAP_ADDR_TYPE_RANDOM_STATIC'.
+     * The identity address cannot be changed while roles are running.
+     *
+     * @param {string} address The local Bluetooth identity address.
+     * @param {string} type The address type. 'BLE_GAP_ADDR_TYPE_RANDOM_STATIC' or `BLE_GAP_ADDR_TYPE_PUBLIC`.
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     setAddress(address, type, callback) {
         // TODO: if privacy is active use this._bleDriver.BLE_GAP_ADDR_CYCLE_MODE_AUTO?
         const cycleMode = this._bleDriver.BLE_GAP_ADDR_CYCLE_MODE_NONE;
-
-        const addressStruct = this._getAddressStruct(address, type);
+        const addressStruct = { address, type };
 
         this._adapter.gapSetAddress(cycleMode, addressStruct, err => {
             if (err) {
-                this.emit('error', _makeError('Failed to set address', err));
+                this.emit('error', _makeError('Failed to set the BLE device\'s GAP address.', err));
             } else if (this._state.address !== address) {
-                this._changeState({ address: address });
+                this._changeState({ address });
             }
 
-            if (callback) { callback(err); }
+            if (_isCallback()) {
+                callback(err);
+            }
         });
     }
 
@@ -1619,10 +1745,12 @@ class Adapter extends EventEmitter {
 
         this._adapter.gapSetDeviceName(convertedSecurity, deviceName, err => {
             if (err) {
-                this.emit('error', _makeError('Failed to set device name', err));
+                this.emit('error', _makeError('Failed to set BLE device\'s device GAP name.', err));
             }
 
-            if (callback) { callback(err); }
+            if (_isCallback()) {
+                callback(err);
+            }
         });
     }
 
@@ -1637,7 +1765,9 @@ class Adapter extends EventEmitter {
                 this.emit('error', _makeError('Failed to set appearance', err));
             }
 
-            if (callback) { callback(err); }
+            if (_isCallback()) {
+                callback(err);
+            }
         });
     }
 
@@ -1652,7 +1782,9 @@ class Adapter extends EventEmitter {
                 this.emit('error', _makeError('Failed to set PPCP', err));
             }
 
-            if (callback) { callback(err); }
+            if (_isCallback()) {
+                callback(err);
+            }
         });
     }
 
@@ -1668,12 +1800,20 @@ class Adapter extends EventEmitter {
         this._setPPCP(ppcpParameter, callback);
     }
 
-    // Get connected device/devices
-    // Callback signature function(devices : Device[]) {}
+    /**
+     * Get this adapter's connected device/devices.
+     * @returns {[Device]} An array of this adapter's connected device/devices.
+     */
     getDevices() {
         return this._devices;
     }
 
+    /**
+     * Get a device connected to this adapter by its instanceId.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     * @returns {null|Device} The device connected to this adapter corresponding to `deviceInstanceId`.
+     */
     getDevice(deviceInstanceId) {
         return this._devices[deviceInstanceId];
     }
@@ -1692,45 +1832,93 @@ class Adapter extends EventEmitter {
         return this._devices[foundDeviceId];
     }
 
-    // Only for central
 
-    // options: { active: x, interval: x, window: x timeout: x TODO: other params}. Callback signature function(err).
+    /**
+     * @summary Start scanning (GAP Discovery procedure, Observer Procedure).
+     *
+     * Available scan parameters:
+     * - {boolean} active If 1, perform active scanning (scan requests).
+     * - {number} interval Scan interval between 0x0004 and 0x4000 in 0.625ms units (2.5ms to 10.24s).
+     * - {number} window Scan window between 0x0004 and 0x4000 in 0.625ms units (2.5ms to 10.24s).
+     * - {number} timeout Scan timeout between 0x0001 and 0xFFFF in seconds, 0x0000 disables timeout.
+     * - {number} use_whitelist If 1, filter advertisers using current active whitelist.
+     * - {number} adv_dir_report If 1, also report directed advertisements where the initiator field is set to a
+     *                           private resolvable address, even if the address did not resolve to an entry in the
+     *                           device identity list. A report will be generated even if the peer is not in the whitelist.
+     * @param {Object} options The GAP scanning parameters.
+     *
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     startScan(options, callback) {
         this._adapter.gapStartScan(options, err => {
             if (err) {
-                this.emit('error', _makeError('Error occured when starting scan', err));
+                this.emit('error', _makeError('Error occurred when starting scan.', err));
             } else {
                 this._changeState({ scanning: true });
             }
 
-            if (callback) { callback(err); }
+            if (_isCallback()) {
+                callback(err);
+            }
         });
     }
 
-    // Callback signature function(err)
+    /**
+     * Stop scanning (GAP Discovery procedure, Observer Procedure).
+     *
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     stopScan(callback) {
         this._adapter.gapStopScan(err => {
             if (err) {
                 // TODO: probably is state already set to false, but should we make sure? if yes, emit stateChanged?
-                this.emit('error', _makeError('Error occured when stopping scanning', err));
+                this.emit('error', _makeError('Error occurred when stopping scanning.', err));
             } else {
                 this._changeState({ scanning: false });
             }
 
-            if (callback) { callback(err); }
+            if (_isCallback()) {
+                callback(err);
+            }
         });
     }
 
-    // options: scanParams, connParams, Callback signature function(err) {}. Do not start service discovery. Err if connection timed out, +++
+    /**
+     * @summary Create a connection (GAP Link Establishment).
+     *
+     * If a scanning procedure is currently in progress it will be automatically stopped when calling this function.
+     *
+     * @param {string} deviceAddress The peer address. If the use_whitelist bit is set in scanParams, then this is ignored.
+     *
+     * Available options:
+     * - {Object} scanParams:
+     *                - {boolean} active: If 1, perform active scanning (scan requests).
+     *                - {number} interval: Scan interval between 0x0004 and 0x4000 in 0.625ms units (2.5ms to 10.24s).
+     *                - {number} window: Scan window between 0x0004 and 0x4000 in 0.625ms units (2.5ms to 10.24s).
+     *                - {number} timeout: Scan timeout between 0x0001 and 0xFFFF in seconds, 0x0000 disables timeout.
+     *                - {number} use_whitelist: If 1, filter advertisers using current active whitelist.
+     *                - {number} adv_dir_report: If 1, also report directed advertisements where the initiator field is set to a
+     *                                          private resolvable address, even if the address did not resolve to an entry in the
+     *                                          device identity list. A report will be generated even if the peer is not in the whitelist.
+     * - {Object} connParams:
+     *                - {number} min_conn_interval: Minimum Connection Interval in 1.25 ms units.
+     *                - {number} max_conn_interval:  Maximum Connection Interval in 1.25 ms units.
+     *                - {number} slave_latency: Slave Latency in number of connection events.
+     *                - {number} conn_sup_timeout: Connection Supervision Timeout in 10 ms units.
+     * @param {Object} options The scan and connection parameters.
+     *
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     connect(deviceAddress, options, callback) {
         if (!_.isEmpty(this._gapOperationsMap)) {
-            const errorObject = _makeError('Could not connect. Another connect is in progress.');
-            this.emit('error', errorObject);
-            if (callback) callback(errorObject);
+            this._checkAndPropagateError('Could not connect.', 'Another connection request is in progress.', callback);
             return;
         }
 
-        var address = {};
+        let address = {};
 
         if (typeof deviceAddress === 'string') {
             address.address = deviceAddress;
@@ -1744,40 +1932,49 @@ class Adapter extends EventEmitter {
         this._adapter.gapConnect(address, options.scanParams, options.connParams, err => {
             if (err) {
                 this._changeState({ connecting: false });
-                const errorMsg = (err.errcode === 'NRF_ERROR_CONN_COUNT') ?
-                    _makeError(`Could not connect. Max number of connections reached.`, err)
-                    : _makeError(`Could not connect to ${deviceAddress.address}`, err);
+                const error = (err.errcode === 'NRF_ERROR_CONN_COUNT') ?
+                    _makeError('Could not connect. Max number of connections reached.', err) :
+                    _makeError(`Could not connect to ${deviceAddress.address}.`, err);
 
-                this.emit('error', errorMsg);
-                if (callback) { callback(errorMsg); }
+                this.emit('error', error);
+                if (_isCallback(callback)) {
+                    callback(error);
+                }
             } else {
-                this._gapOperationsMap.connecting = { deviceAddress: address, callback: callback };
+                this._gapOperationsMap.connecting = { deviceAddress: address, callback };
+                
+                if (_isCallback(callback)) {
+                    callback();
+                }
             }
         });
     }
 
     /**
-     * Cancel connection currently in progress.
+     * Cancel a connection establishment.
+     *
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
      */
     cancelConnect(callback) {
         this._adapter.gapCancelConnect(err => {
             if (err) {
-                // TODO: log more
-                const newError = _makeError('Error occured when canceling connection', err);
-                this.emit('error', newError);
-                if (callback) { callback(newError); }
-            } else {
-                delete this._gapOperationsMap.connecting;
-                this._changeState({ connecting: false });
-                if (callback) { callback(undefined); }
+                this._checkAndPropagateError(err, 'Error occurred when cancelling connection request.', callback);
+                return;
+            }
+
+            delete this._gapOperationsMap.connecting;
+            this._changeState({ connecting: false });
+
+            if (_isCallback(callback)) {
+                callback();
             }
         });
     }
 
-    // Enable the client role and starts advertising
-
+    // enable the client role and starts advertising
     _getAdvertisementParams(params) {
-        var retval = {};
+        const retval = {};
 
         retval.channel_mask = {};
         retval.channel_mask.ch_37_off = false;
@@ -1785,19 +1982,22 @@ class Adapter extends EventEmitter {
         retval.channel_mask.ch_39_off = false;
 
         if (params.channelMask) {
-            for (let channel in params.channelMask) {
-                switch (params.channelMask[channel]) {
-                    case 'ch37off':
-                        retval.channel_mask.ch_37_off = true;
-                        break;
-                    case 'ch38off':
-                        retval.channel_mask.ch_38_off = true;
-                        break;
-                    case 'ch39off':
-                        retval.channel_mask.ch_39_off = true;
-                        break;
-                    default:
-                        throw new Error(`Channel ${channel} is not possible to switch off during advertising.`);
+            for (const channel in params.channelMask) {
+                if (Object.prototype.hasOwnProperty.call(params.channelMask, channel) ||
+                    {}.hasOwnProperty.call(params.channelMask, channel)) {
+                    switch (params.channelMask[channel]) {
+                        case 'ch37off':
+                            retval.channel_mask.ch_37_off = true;
+                            break;
+                        case 'ch38off':
+                            retval.channel_mask.ch_38_off = true;
+                            break;
+                        case 'ch39off':
+                            retval.channel_mask.ch_39_off = true;
+                            break;
+                        default:
+                            throw new Error(`Channel ${channel} is not possible to switch off during advertising.`);
+                    }
                 }
             }
         }
@@ -1836,66 +2036,123 @@ class Adapter extends EventEmitter {
         return retval;
     }
 
-    // Callback function signature: function(err) {}
+    /**
+     * @summary Start advertising (GAP Discoverable, Connectable modes, Broadcast Procedure).
+     *
+     * An application can start an advertising procedure for broadcasting purposes while a connection
+     * is active. After a BLE_GAP_EVT_CONNECTED event is received, this function may therefore
+     * be called to start a broadcast advertising procedure. The advertising procedure
+     * cannot however be connectable (it must be of type BLE_GAP_ADV_TYPE_ADV_SCAN_IND or
+     *  BLE_GAP_ADV_TYPE_ADV_NONCONN_IND).
+     *
+     * Only one advertiser may be active at any time.
+     *
+     * Available GAP advertising parameters:
+     * - {number} channelMask: Channel mask for RF channels used in advertising. Default: all channels on.
+     * - {number} interval: GAP Advertising interval. Required: an interval must be provided.
+     * - {number} timeout: Maximum advertising time in limited discoverable mode. Required: a timeout must be provided.
+     * - {boolean} connectable: GAP Advertising type connectable. Default: The device is connectable.
+     * - {boolean} scannable: GAP Advertising type scannable. Default: The device is undirected.
+     * @param {Object} options GAP advertising parameters.
+     *
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     startAdvertising(options, callback) {
         const advParams = this._getAdvertisementParams(options);
 
         this._adapter.gapStartAdvertising(advParams, err => {
-            if (this._checkAndPropagateError(err, 'Failed to start advertising.', callback)) return;
+            if (this._checkAndPropagateError(err, 'Failed to start advertising.', callback)) {
+                return;
+            }
+
             this._changeState({ advertising: true });
-            if (callback) { callback(); }
+            if (_isCallback(callback)) {
+                callback(undefined);
+            }
         });
     }
 
     /**
-     * Set the advertising data for this adapter. Callback function(err).
+     * @summary Set, clear or update advertising and scan response data.
+
+     * The format of the advertising data will be checked by this call to ensure interoperability.
+     * Limitations imposed by this API call to the data provided include having a flags data type in the scan response data and
+     * duplicating the local name in the advertising data and scan response data.
+     *
+     * To clear the advertising data and set it to a 0-length packet, simply provide a null `advData`/`scanRespData` parameter.
+     *
+     * The call will fail if `advData` and `scanRespData` are both null since this would have no effect.
+     *
+     * See @ref: ./util/adType.js for possible advertisement object parameters.
+     * @param {Object} advData Advertising packet
+     * @param {Object} scanRespData Scan response packet.
+     *
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
      */
     setAdvertisingData(advData, scanRespData, callback) {
         const advDataStruct = Array.from(AdType.convertToBuffer(advData));
         const scanRespDataStruct = Array.from(AdType.convertToBuffer(scanRespData));
 
-        this._adapter.gapSetAdvertisingData(
-            advDataStruct,
-            scanRespDataStruct,
-            err => {
-                if (this._checkAndPropagateError(err, 'Failed to set advertising data.', callback)) return;
-                if (callback) { callback(); }
+        this._adapter.gapSetAdvertisingData(advDataStruct, scanRespDataStruct, err => {
+            if (this._checkAndPropagateError(err, 'Failed to set advertising data.', callback)) {
+                return;
             }
-        );
-    }
 
-    // Callback function signature: function(err) {}
-    stopAdvertising(callback) {
-        this._adapter.gapStopAdvertising(err => {
-            if (this._checkAndPropagateError(err, 'Failed to stop advertising.', callback)) return;
-            this._changeState({ advertising: false });
-            if (callback) { callback(); }
+            if (_isCallback(callback)) {
+                callback();
+            }
         });
     }
 
-    // Central/peripheral
+    /**
+     * Stop advertising (GAP Discoverable, Connectable modes, Broadcast Procedure).
+     *
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
+    stopAdvertising(callback) {
+        this._adapter.gapStopAdvertising(err => {
+            if (this._checkAndPropagateError(err, 'Failed to stop advertising.', callback)) {
+                return;
+            }
 
+            this._changeState({ advertising: false });
+            if (_isCallback(callback)) {
+                callback();
+            }
+        });
+    }
+
+    /**
+     * @summary Disconnect (GAP Link Termination).
+
+     * This call initiates the disconnection procedure, and its completion will be communicated to the application
+     * with a `BLE_GAP_EVT_DISCONNECTED` event upon which `callback` will be called.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     disconnect(deviceInstanceId, callback) {
-        const device = this.getDevice(deviceInstanceId);
+        const device = this._getDeviceByIdAndPropagateError(deviceInstanceId, 'Failed to disconnect.', callback);
         if (!device) {
-            const errorObject = _makeError('Failed to disconnect', 'Failed to find device with id ' + deviceInstanceId);
-            this.emit('error', errorObject);
-            if (callback) callback(errorObject);
             return;
-
         }
 
         const hciStatusCode = this._bleDriver.BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION;
         this._adapter.gapDisconnect(device.connectionHandle, hciStatusCode, err => {
             if (err) {
-                const errorObject = _makeError('Failed to disconnect', err);
-                this.emit('error', errorObject);
-                if (callback) { callback(errorObject); }
+                const error = _makeError('Failed to disconnect', err);
+                this.emit('error', error);
+
+                if (_isCallback(callback)) {
+                    callback(error);
+                }
             } else {
-                // Expect a disconnect event down the road
-                this._gapOperationsMap[deviceInstanceId] = {
-                    callback: callback,
-                };
+                // expect a disconnect event down the road
+                this._gapOperationsMap[deviceInstanceId] = { callback };
             }
         });
     }
@@ -1909,45 +2166,83 @@ class Adapter extends EventEmitter {
         };
     }
 
-    // options: connParams, callback signature function(err) {} returns true/false
+    /**
+     * @summary Update connection parameters.
+     *
+     * In the central role this will initiate a Link Layer connection parameter update procedure,
+     * otherwise in the peripheral role, this will send the corresponding L2CAP request and wait for
+     * the central to perform the procedure. In both cases, and regardless of success or failure, the application
+     * will be informed of the result with a `BLE_GAP_EVT_CONN_PARAM_UPDATE` event.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     *
+     * Available GAP Connection Parameters:
+     * - {number} min_conn_interval: Minimum Connection Interval in 1.25 ms units.
+     * - {number} max_conn_interval:  Maximum Connection Interval in 1.25 ms units.
+     * - {number} slave_latency: Slave Latency in number of connection events.
+     * - {number} conn_sup_timeout: Connection Supervision Timeout in 10 ms units.
+     * @param {Object} options GAP Connection Parameters.
+     *
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     updateConnectionParameters(deviceInstanceId, options, callback) {
-        const device = this.getDevice(deviceInstanceId);
+        const device = this._getDeviceByIdAndPropagateError(deviceInstanceId,
+                                                            'Failed to update connection parameters.', callback);
         if (!device) {
-            throw new Error('No device with instance id: ' + deviceInstanceId);
+            return;
         }
 
         const connectionParamsStruct = this._getConnectionUpdateParams(options);
         this._adapter.gapUpdateConnectionParameters(device.connectionHandle, connectionParamsStruct, err => {
             if (err) {
                 const errorObject = _makeError('Failed to update connection parameters', err);
+                
                 this.emit('error', errorObject);
-                if (callback) { callback(errorObject); }
+                if (_isCallback(callback)) {
+                    callback(errorObject);
+                }
             } else {
-                this._gapOperationsMap[deviceInstanceId] = {
-                    callback,
-                };
+                this._gapOperationsMap[deviceInstanceId] = { callback };
             }
         });
     }
 
-    // Central role
-
-    // callback signature function(err) {}
+    /**
+     * Reject a GAP connection parameters update request.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     rejectConnParams(deviceInstanceId, callback) {
-        const connectionHandle = this.getDevice(deviceInstanceId).connectionHandle;
+        const device = this._getDeviceByIdAndPropagateError(deviceInstanceId,
+                                                            'Failed to reject connection parameters.', callback);
+        if (!device) {
+            return;
+        }
 
-        // TODO: Does the AddOn support undefined second parameter?
+        const connectionHandle = device.connectionHandle;
+        // TODO: does the AddOn support undefined second parameter?
         this._adapter.gapUpdateConnectionParameters(connectionHandle, null, err => {
             if (this._checkAndPropagateError(err, 'Failed to reject connection parameters', callback)) {
                 return;
             }
 
-            if (callback) { callback(err); }
+            if (_isCallback(callback)) {
+                callback();
+            }
         });
     }
 
+    /**
+     * Get the current ATT_MTU size.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     * @returns {undefined|number} The current ATT_MTU size.
+     */
     getCurrentAttMtu(deviceInstanceId) {
-        if (!(deviceInstanceId in this._attMtuMap)) {
+        if (!(this._attMtuMap[deviceInstanceId])) {
             return;
         }
 
@@ -1955,51 +2250,92 @@ class Adapter extends EventEmitter {
     }
 
     /**
-     * Request a change in the ATT_MTU. The resulting mtu will be returned in the callback.
+     * @summary Start an ATT_MTU exchange by sending an Exchange MTU Request to the server.
      *
-     * @param {string} deviceInstanceId
-     * @param {number} mtu - requested ATT_MTU. Default ATT_MTU is 23. Valid range is between 24 and 247.
-     * @param {function} callback - signature (err, mtu)
+     * The SoftDevice sets ATT_MTU to the minimum of:
+     *     - The Client RX MTU value, and
+     *     - The Server RX MTU value from `BLE_GATTC_EVT_EXCHANGE_MTU_RSP`.
+     *
+     *     However, the SoftDevice never sets ATT_MTU lower than `GATT_MTU_SIZE_DEFAULT` == 23.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     * @param {number} mtu Requested ATT_MTU. Default ATT_MTU is 23. Valid range is between 24 and 247.
+     * @param {function} callback Callback signature: (err, mtu) => {}.
+     * @returns {void}
      */
-     requestAttMtu(deviceInstanceId, mtu, callback) {
+    requestAttMtu(deviceInstanceId, mtu, callback) {
         if (this._bleDriver.NRF_SD_BLE_API_VERSION <= 2) {
-            if (callback) callback(null, this._bleDriver.GATT_MTU_SIZE_DEFAULT);
+            if (_isCallback(callback)) {
+                callback(undefined, this._bleDriver.GATT_MTU_SIZE_DEFAULT);
+            }
+
             return;
         }
 
-        const device = this.getDevice(deviceInstanceId);
-
+        const device = this._getDeviceByIdAndPropagateError(deviceInstanceId, 'Failed to request att mtu.', callback);
         if (!device) {
-            const errorObject = _makeError('Failed to request att mtu', 'Failed to find device with id ' + deviceInstanceId);
-            if (callback) callback(errorObject);
             return;
         }
 
         if (this._gattOperationsMap[device.instanceId]) {
-            this.emit('error', _makeError('Failed to get services, a GATT operation already in progress'));
+            const error = _makeError('Failed to request att mtu, a GATT operation is already in progress.');
+
+            this.emit('error', error);
+            if (_isCallback(callback)) {
+                callback(error);
+            }
+
             return;
         }
 
         this._adapter.gattcExchangeMtuRequest(device.connectionHandle, mtu, err => {
             if (err) {
-                const errorObject = _makeError('Failed to request att mtu', err);
-                if (callback) callback(errorObject);
+                const error = _makeError('Failed to request att mtu', err);
+                if (_isCallback(callback)) {
+                    callback(error);
+                }
+
                 return;
             }
 
-            this._gattOperationsMap[device.instanceId] = { callback: callback, clientRxMtu: mtu };
+            this._gattOperationsMap[device.instanceId] = { callback, clientRxMtu: mtu };
         });
     }
 
+    /**
+     * @summary Initiate the GAP Authentication procedure.
+     *
+     * In the central role, this function will send an SMP Pairing Request (or an SMP Pairing Failed if rejected),
+     * otherwise in the peripheral role, an SMP Security Request will be sent.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     *
+     * Available GAP security parameters:
+     * - {boolean} bond Perform bonding.
+     * - {boolean} lesc Enable LE Secure Connection pairing.
+     * - {boolean} keypress Enable generation of keypress notifications.
+     * - {Object} io_caps IO capabilities, see @ref BLE_GAP_IO_CAPS.
+     * - {boolean} oob Out Of Band data available.
+     * - {number} min_key_size Minimum encryption key size in octets between 7 and 16. If 0 then not applicable in this instance.
+     * - {number} max_key_size Maximum encryption key size in octets between min_key_size and 16.
+     * - {Object} kdist_own Key distribution bitmap: keys that the local device will distribute.
+     *                - {boolean} enc Long Term Key and Master Identification.
+     *                - {boolean} id Identity Resolving Key and Identity Address Information.
+     *                - {boolean} sign Connection Signature Resolving Key.
+     *                - {boolean} link Derive the Link Key from the LTK.
+     * - {Object} kdist_peer Key distribution bitmap: keys that the remote device will distribute.
+     *                - ^^ Same as properties as `kdist_own` above. ^^
+     * @param {object} secParams The security parameters to be used during the pairing or bonding procedure.
+     *                           In the peripheral role, only the bond, mitm, lesc and keypress fields of this Object are used.
+     *                           In the central role, this pointer may be NULL to reject a Security Request.
+     *
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     authenticate(deviceInstanceId, secParams, callback) {
-        const device = this.getDevice(deviceInstanceId);
-
+        const device = this._getDeviceByIdAndPropagateError(deviceInstanceId, 'Failed to authenticate.', callback);
         if (!device) {
-            const errorObject = _makeError('Failed to authenticate', 'Failed to find device with id ' + deviceInstanceId);
-            this.emit('error', errorObject);
-            if (callback) { callback(errorObject); }
             return;
-
         }
 
         if (device.role === 'central') {
@@ -2015,33 +2351,70 @@ class Adapter extends EventEmitter {
                 return;
             }
 
-            if (callback) { callback(); }
+            if (_isCallback(callback)) {
+                callback();
+            }
         });
     }
 
+    /**
+     * @summary Reply with GAP security parameters.
+     *
+     * This function is only used to reply to a `BLE_GAP_EVT_SEC_PARAMS_REQUEST`, calling it at other times will result in an `NRF_ERROR_INVALID_STATE`.
+     * If the call returns an error code, the request is still pending, and the reply call may be repeated with corrected parameters.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     * @param {string} secStatus Security status, see `BLE_GAP_SEC_STATUS`.
+     * @param {Object} secParams Security parameters object. In the central role this must be set to null, as the parameters have
+     *                           already been provided during a previous call to `this.authenticate()`.
+     * @param {Object} secKeyset security key set object.
+     *            - {Object} kdist_own Key distribution bitmap: keys that the local device will distribute.
+     *                - {boolean} enc Long Term Key and Master Identification.
+     *                - {boolean} id Identity Resolving Key and Identity Address Information.
+     *                - {boolean} sign Connection Signature Resolving Key.
+     *                - {boolean} link Derive the Link Key from the LTK.
+     *            - {Object} kdist_peer Key distribution bitmap: keys that the remote device will distribute.
+     *                - ^^ Same as properties as `kdist_own` above. ^^
+     * @param {function} callback Callback signature: (err, secKeyset) => {}.
+     * @returns {void}
+     */
     replySecParams(deviceInstanceId, secStatus, secParams, secKeyset, callback) {
-        const device = this.getDevice(deviceInstanceId);
-
+        const device = this._getDeviceByIdAndPropagateError(deviceInstanceId,
+                                                            'Failed to reply to security parameters.', callback);
         if (!device) {
-            const errorObject = _makeError('Failed to reply security parameters', 'Failed to find device with id ' + deviceInstanceId);
-            this.emit('error', errorObject);
-            if (callback) { callback(errorObject); }
             return;
         }
 
-        this._adapter.gapReplySecurityParameters(device.connectionHandle, secStatus, secParams, secKeyset, (err, secKeyset) => {
-            if (this._checkAndPropagateError(err, 'Failed to reply security parameters.', callback)) { return; }
-            if (callback) { callback(err, secKeyset); }
+        this._adapter.gapReplySecurityParameters(device.connectionHandle, secStatus, secParams, secKeyset, (err, _secKeyset) => {
+            if (this._checkAndPropagateError(err, 'Failed to reply security parameters.', callback)) {
+                return;
+            }
+
+            if (_isCallback(callback)) {
+                callback(undefined, _secKeyset);
+            }
         });
     }
 
+    /**
+     * @summary Reply with an authentication key.
+     *
+     * This function is only used to reply to a `BLE_GAP_EVT_AUTH_KEY_REQUEST `or a `BLE_GAP_EVT_PASSKEY_DISPLAY`, calling it at other times will result in an `NRF_ERROR_INVALID_STATE`.
+     * If the call returns an error code, the request is still pending, and the reply call may be repeated with corrected parameters.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     * @param {Object} keyType No key, 6-digit Passkey or Out Of Band data.
+     * @param {null|Array|string} key If key type is `BLE_GAP_AUTH_KEY_TYPE_NONE`, then null.
+     *                            If key type is `BLE_GAP_AUTH_KEY_TYPE_PASSKEY`, then a 6-byte array (digit 0..9 only)
+     *                                or null when confirming LE Secure Connections Numeric Comparison.
+     *                            If key type is `BLE_GAP_AUTH_KEY_TYPE_OOB`, then a 16-byte OOB key value in Little Endian format.
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     replyAuthKey(deviceInstanceId, keyType, key, callback) {
-        const device = this.getDevice(deviceInstanceId);
-
+        const device = this._getDeviceByIdAndPropagateError(deviceInstanceId,
+                                                            'Failed to reply authenticate key.', callback);
         if (!device) {
-            const errorObject = _makeError('Failed to reply authenticate key', 'Failed to find device with id ' + deviceInstanceId);
-            this.emit('error', errorObject);
-            if (callback) { callback(errorObject); }
             return;
         }
 
@@ -2051,127 +2424,201 @@ class Adapter extends EventEmitter {
         }
 
         this._adapter.gapReplyAuthKey(device.connectionHandle, keyType, key, err => {
-            if (this._checkAndPropagateError(err, 'Failed to reply authenticate key.', callback)) { return; }
-            if (callback) { callback(); }
+            if (this._checkAndPropagateError(err, 'Failed to reply authenticate key.', callback)) {
+                return;
+            }
+
+            if (_isCallback(callback)) {
+                callback();
+            }
         });
     }
 
+    /**
+     * @summary Reply with an LE Secure connections DHKey.
+     *
+     * This function is only used to reply to a `BLE_GAP_EVT_LESC_DHKEY_REQUEST`, calling it at other times will result in an `NRF_ERROR_INVALID_STATE`.
+     * If the call returns an error code, the request is still pending, and the reply call may be repeated with corrected parameters.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     * @param {Object} dhkey LE Secure Connections DHKey.
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     replyLescDhkey(deviceInstanceId, dhkey, callback) {
-        const device = this.getDevice(deviceInstanceId);
-
+        const device = this._getDeviceByIdAndPropagateError(deviceInstanceId, 'Failed to reply lesc dh key.', callback);
         if (!device) {
-            const errorObject = _makeError('Failed to reply lesc dh key', 'Failed to find device with id ' + deviceInstanceId);
-            this.emit('error', errorObject);
-            if (callback) { callback(errorObject); }
             return;
         }
 
         this._adapter.gapReplyLescDhKey(device.connectionHandle, dhkey, err => {
-            if (this._checkAndPropagateError(err, 'Failed to reply lesc dh key.', callback)) { return; }
-            if (callback) { callback(); }
+            if (this._checkAndPropagateError(err, 'Failed to reply lesc dh key.', callback)) {
+                return;
+            }
+
+            if (_isCallback(callback)) {
+                callback();
+            }
         });
     }
 
+    /**
+     * @summary Notify the peer of a local keypress.
+     *
+     * This function can only be used when an authentication procedure using LE Secure Connection is in progress. Calling it at other times will result in an `NRF_ERROR_INVALID_STATE`.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     * @param {number} notificationType See `adapter.driver.BLE_GAP_KP_NOT_TYPES`.
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     notifyKeypress(deviceInstanceId, notificationType, callback) {
-        const device = this.getDevice(deviceInstanceId);
-
+        const device = this._getDeviceByIdAndPropagateError(deviceInstanceId, 'Failed to notify keypress.', callback);
         if (!device) {
-            const errorObject = _makeError('Failed to notify keypress', 'Failed to find device with id ' + deviceInstanceId);
-            this.emit('error', errorObject);
-            if (callback) { callback(errorObject); }
             return;
         }
 
         this._adapter.gapNotifyKeypress(device.connectionHandle, notificationType, err => {
-            if (this._checkAndPropagateError(err, 'Failed to notify keypress.', callback)) { return; }
-            if (callback) { callback(); }
+            if (this._checkAndPropagateError(err, 'Failed to notify keypress.', callback)) {
+                return;
+            }
+
+            if (_isCallback(callback)) {
+                callback();
+            }
         });
     }
 
+    /**
+     * @summary Generate a set of OOB data to send to a peer out of band.
+     *
+     * The `ble_gap_addr_t` included in the OOB data returned will be the currently active one (or, if a connection has already been established,
+     * the one used during connection setup). The application may manually overwrite it with an updated value.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     * @param {string} ownPublicKey LE Secure Connections local P-256 Public Key.
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     getLescOobData(deviceInstanceId, ownPublicKey, callback) {
-        const device = this.getDevice(deviceInstanceId);
-
+        const device = this._getDeviceByIdAndPropagateError(deviceInstanceId, 'Failed to get lesc oob data.', callback);
         if (!device) {
-            const errorObject = _makeError('Failed to get lesc oob data', 'Failed to find device with id ' + deviceInstanceId);
-            this.emit('error', errorObject);
-            if (callback) { callback(errorObject); }
             return;
         }
 
         this._adapter.gapGetLescOobData(device.connectionHandle, ownPublicKey, (err, ownOobData) => {
-            let errorObject;
-            if (err) {
-                errorObject = _makeError('Failed to get lesc oob data');
-                this.emit('error', errorObject);
+            if (this._checkAndPropagateError(err, 'Failed to get lesc oob data', callback)) {
+                return;
             }
 
-            if (callback) { callback(errorObject, ownOobData); }
+            if (_isCallback(callback)) {
+                callback(undefined, ownOobData);
+            }
         });
     }
 
+    /**
+     * @summary Provide the OOB data sent/received out of band.
+     *
+     * At least one of the 2 data objects provided must not be null.
+     * An authentication procedure with OOB selected as an algorithm must be in progress when calling this function.
+     * A `BLE_GAP_EVT_LESC_DHKEY_REQUEST` event with the oobd_req set to 1 must have been received prior to calling this function.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     * @param {string} ownOobData The OOB data sent out of band to a peer or NULL if none sent.
+     * @param {string} peerOobData The OOB data received out of band from a peer or NULL if none received.
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     setLescOobData(deviceInstanceId, ownOobData, peerOobData, callback) {
-        const device = this.getDevice(deviceInstanceId);
-
+        const device = this._getDeviceByIdAndPropagateError(deviceInstanceId, 'Failed to set lesc oob data.', callback);
         if (!device) {
-            const errorObject = _makeError('Failed to set lesc oob data', 'Failed to find device with id ' + deviceInstanceId);
-            this.emit('error', errorObject);
-            if (callback) { callback(errorObject); }
             return;
         }
 
         this._adapter.gapSetLescOobData(device.connectionHandle, ownOobData, peerOobData, err => {
-            this._checkAndPropagateError(err, 'Failed to set lesc oob data.', callback);
-        });
+            if (this._checkAndPropagateError(err, 'Failed to set lesc oob data.', callback)) {
+                return;
+            }
 
-        if (callback) { callback(); }
+            if (_isCallback(callback)) {
+                callback();
+            }
+        });
     }
 
-    encrypt(deviceInstanceId, masterId, encInfo, callback) {
-        const device = this.getDevice(deviceInstanceId);
 
+    /**
+     * @summary Initiate GAP Encryption procedure.
+     *
+     * In the central role, this function will initiate the encryption procedure using the encryption information provided.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     * @param {Object} masterId Master identification structure. TODO
+     * @param {Object} encInfo Encryption information structure. TODO
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
+    encrypt(deviceInstanceId, masterId, encInfo, callback) {
+        const device = this._getDeviceByIdAndPropagateError(deviceInstanceId, 'Failed to encrypt.', callback);
         if (!device) {
-            const errorObject = _makeError('Failed to encrypt', 'Failed to find device with id ' + deviceInstanceId);
-            this.emit('error', errorObject);
-            if (callback) { callback(errorObject); }
             return;
         }
 
         this._adapter.gapEncrypt(device.connectionHandle, masterId, encInfo, err => {
-            let errorObject;
-            if (err) {
-                errorObject = _makeError('Failed to encrypt');
-                this.emit('error', errorObject);
+            if (this._checkAndPropagateError(err, 'Failed to encrypt.', callback)) {
+                return;
             }
 
-            if (callback) { callback(errorObject); }
+            if (_isCallback(callback)) {
+                callback();
+            }
         });
     }
 
+    /**
+     * @summary Reply with GAP security information.
+     *
+     * This function is only used to reply to a `BLE_GAP_EVT_SEC_INFO_REQUEST`, calling it at other times will result in `NRF_ERROR_INVALID_STATE`.
+     * If the call returns an error code, the request is still pending, and the reply call may be repeated with corrected parameters.
+     * Data signing is not yet supported, and signInfo must therefore be null.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     * @param {Object} encInfo Encryption information structure. May be null to signal none is available.
+     * @param {Object} idInfo Identity information structure. May be null to signal none is available.
+     * @param {Object} signInfo Pointer to a signing information structure. May be null to signal none is available.
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     secInfoReply(deviceInstanceId, encInfo, idInfo, signInfo, callback) {
-        const device = this.getDevice(deviceInstanceId);
-
+        const device = this._getDeviceByIdAndPropagateError(deviceInstanceId, 'secInfoReply() failed.', callback);
         if (!device) {
-            const errorObject = _makeError('Failed to encrypt', 'Failed to find device with id ' + deviceInstanceId);
-            this.emit('error', errorObject);
-            if (callback) { callback(errorObject); }
             return;
         }
 
         this._adapter.gapReplySecurityInfo(device.connectionHandle, encInfo, idInfo, signInfo, err => {
             let errorObject;
+
             if (err) {
-                errorObject = _makeError('Failed to encrypt');
+                errorObject = _makeError('secInfoReply() failed.', err);
                 this.emit('error', errorObject);
             }
 
-            if (callback) { callback(errorObject); }
+            if (_isCallback(callback)) {
+                callback(errorObject);
+            }
         });
     }
 
-    // GATTS
-    // Array of services
+    /**
+     * Set the services in the BLE peripheral device's GATT attribute table.
+     *
+     * @param {[Service]} services An array of `Service` objects to be set.
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     setServices(services, callback) {
-        let decodeUUID = (uuid, data) => {
+        const decodeUUID = (uuid, data) => {
             return new Promise((resolve, reject) => {
                 const length = uuid.length === 32 ? 16 : 2;
 
@@ -2208,10 +2655,10 @@ class Adapter extends EventEmitter {
             });
         };
 
-        let addService = (service, type, data) => {
+        const addService = (service, type, data) => {
             return new Promise((resolve, reject) => {
-                var p = Promise.resolve(data);
-                var decode = decodeUUID.bind(undefined, service.uuid);
+                let p = Promise.resolve(data);
+                const decode = decodeUUID.bind(undefined, service.uuid);
 
                 p.then(decode).then(data => {
                     this._adapter.gattsAddService(type, data.decoded_uuid, (err, serviceHandle) => {
@@ -2230,7 +2677,7 @@ class Adapter extends EventEmitter {
             });
         };
 
-        let addCharacteristic = (characteristic, data) => {
+        const addCharacteristic = (characteristic, data) => {
             return new Promise((resolve, reject) => {
                 this._converter.characteristicToDriver(characteristic, (err, characteristicForDriver) => {
                     if (err) {
@@ -2271,8 +2718,11 @@ class Adapter extends EventEmitter {
                                         cccdDescriptor.handle = handles.cccd_handle;
                                         cccdDescriptor.value = {};
 
-                                        for (let deviceInstanceId in this._devices) {
-                                            this._setDescriptorValue(cccdDescriptor, [0, 0], deviceInstanceId);
+                                        for (const deviceInstanceId in this._devices) {
+                                            if (Object.prototype.hasOwnProperty.call(this._devices, deviceInstanceId) ||
+                                                {}.hasOwnProperty.call(this._devices, deviceInstanceId)) {
+                                                this._setDescriptorValue(cccdDescriptor, [0, 0], deviceInstanceId);
+                                            }
                                         }
                                     }
 
@@ -2289,15 +2739,13 @@ class Adapter extends EventEmitter {
             });
         };
 
-        let addDescriptor = (descriptor, data) => {
+        const addDescriptor = (descriptor, data) => {
             return new Promise((resolve, reject) => {
                 this._converter.descriptorToDriver(descriptor, (err, descriptorForDriver) => {
                     if (err) {
                         reject(_makeError('Error converting descriptor.', err));
                     } else if (descriptorForDriver) {
-                        this._adapter.gattsAddDescriptor(
-                            data.characteristicHandle,
-                            descriptorForDriver,
+                        this._adapter.gattsAddDescriptor(data.characteristicHandle, descriptorForDriver,
                             (err, handle) => {
                                 if (err) {
                                     reject(_makeError(err, 'Error adding descriptor.'));
@@ -2313,15 +2761,15 @@ class Adapter extends EventEmitter {
             });
         };
 
-        let promiseSequencer = (list, data) => {
-            var p = Promise.resolve(data);
+        const promiseSequencer = (list, data) => {
+            const p = Promise.resolve(data);
             return list.reduce((previousP, nextP) => {
                 return previousP.then(nextP);
             }, p);
         };
 
-        let applyGapServiceCharacteristics = gapService => {
-            for (let characteristic of gapService._factory_characteristics) {
+        const applyGapServiceCharacteristics = gapService => {
+            for (const characteristic of gapService._factory_characteristics) {
                 // TODO: Fix Device Name uuid magic number
                 if (characteristic.uuid === '2A00') {
                     // TODO: At some point addon should accept string.
@@ -2359,37 +2807,35 @@ class Adapter extends EventEmitter {
         };
 
         // Create array of function objects to call in sequence.
-        var promises = [];
+        let promises = [];
 
-        for (let service of services) {
-            var p;
+        for (const service of services) {
+            let p;
 
             if (service.uuid === '1800') {
                 service.startHandle = 1;
                 service.endHandle = 7;
                 applyGapServiceCharacteristics(service);
                 this._services[service.instanceId] = service;
-                continue;
             } else if (service.uuid === '1801') {
                 service.startHandle = 8;
                 service.endHandle = 8;
                 this._services[service.instanceId] = service;
-                continue;
-            }
+            } else {
+                p = addService.bind(undefined, service, this._getServiceType(service));
+                promises.push(p);
 
-            p = addService.bind(undefined, service, this._getServiceType(service));
-            promises.push(p);
+                if (service._factory_characteristics) {
+                    for (const characteristic of service._factory_characteristics) {
+                        p = addCharacteristic.bind(undefined, characteristic);
+                        promises.push(p);
 
-            if (service._factory_characteristics) {
-                for (let characteristic of service._factory_characteristics) {
-                    p = addCharacteristic.bind(undefined, characteristic);
-                    promises.push(p);
-
-                    if (characteristic._factory_descriptors) {
-                        for (let descriptor of characteristic._factory_descriptors) {
-                            if (!this._converter.isSpecialUUID(descriptor.uuid)) {
-                                p = addDescriptor.bind(undefined, descriptor);
-                                promises.push(p);
+                        if (characteristic._factory_descriptors) {
+                            for (const descriptor of characteristic._factory_descriptors) {
+                                if (!this._converter.isSpecialUUID(descriptor.uuid)) {
+                                    p = addDescriptor.bind(undefined, descriptor);
+                                    promises.push(p);
+                                }
                             }
                         }
                     }
@@ -2401,68 +2847,108 @@ class Adapter extends EventEmitter {
         // is propagated to all promises.
         promiseSequencer(promises, {}).then(data => {
             // TODO: Ierate over all servicses, descriptors, characterstics from parameter services
-            if (callback) { callback(); }
+            if (_isCallback(callback)) {
+                callback();
+            }
         }).catch(err => {
             this.emit('error', err);
-            if (callback) { callback(err); }
+            if (_isCallback(callback)) {
+                callback(err);
+            }
         });
     }
 
-    // GATTS/GATTC
-
-    // Callback signature function(err, service) {}
-    getService(serviceInstanceId, callback) {
+    /**
+     * Get a `Service` instance by its instanceId.
+     *
+     * @param {string} serviceInstanceId The unique Id of this service.
+     * @returns {Service} The service.
+     */
+    getService(serviceInstanceId) {
         // TODO: Do read on service? callback?
         return this._services[serviceInstanceId];
     }
 
-    // Callback signature function(err, services) {}. If deviceInstanceId is local, local database (GATTS)
+    /**
+     * Initiate or continue a GATT Primary Service Discovery procedure.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     * @param {function} callback Callback signature: (err, services) => {}.
+     * @returns {void}
+     */
     getServices(deviceInstanceId, callback) {
-        // TODO: Implement something for when device is local
-        const device = this.getDevice(deviceInstanceId);
-
-        if (this._gattOperationsMap[device.instanceId]) {
-            this.emit('error', _makeError('Failed to get services, a GATT operation already in progress'));
+        // TODO: implement something for when device is local
+        const device = this._getDeviceByIdAndPropagateError(deviceInstanceId, 'Failed to get services.', callback);
+        if (!device) {
             return;
         }
 
-        // TODO: Should we remove old services and do new discovery?
+        if (this._gattOperationsMap[device.instanceId]) {
+            this._checkAndPropagateError('A GATT operation already in progress.', 'Failed to get services.', callback);
+            return;
+        }
+
+        // TODO: should we remove old services and do new discovery?
         const alreadyFoundServices = _.filter(this._services, service => {
             return deviceInstanceId === service.deviceInstanceId;
         });
 
         if (!_.isEmpty(alreadyFoundServices)) {
-            if (callback) { callback(undefined, alreadyFoundServices); }
+            if (_isCallback(callback)) {
+                callback(undefined, alreadyFoundServices);
+            }
+
             return;
         }
 
-        this._gattOperationsMap[device.instanceId] = { callback: callback, pendingHandleReads: {}, parent: device };
+        // TODO: we register callback here but then are also calling it upon success with `services` is this correct?
+        this._gattOperationsMap[device.instanceId] = { callback, pendingHandleReads: {}, parent: device };
         this._adapter.gattcDiscoverPrimaryServices(device.connectionHandle, 1, null, (err, services) => {
             if (err) {
                 this.emit('error', _makeError('Failed to get services', err));
-                if (callback) { callback(err); }
-                return;
+                if (_isCallback(callback)) {
+                    callback(err);
+                }
+            } else if (_isCallback(callback)) {
+                callback(undefined, services);
             }
         });
     }
 
+    /**
+     * Get a `Characteristic` instance by its instanceId.
+     *
+     * @param {string} characteristicId The unique Id of this characteristic.
+     * @returns {Characteristic} The characteristic.
+     */
     getCharacteristic(characteristicId) {
         return this._characteristics[characteristicId];
     }
 
+    /**
+     * Initiate or continue a GATT Characteristic Discovery procedure.
+     *
+     *
+     * @param {string} serviceId Unique ID of of the GATT service.
+     * @param {function} callback Callback signature: (err, characteristics) => {}.
+     * @returns {void}
+     */
     getCharacteristics(serviceId, callback) {
         // TODO: Implement something for when device is local
-
         const service = this.getService(serviceId);
-
         if (!service) {
-            throw new Error(_makeError('Failed to get characteristics.', 'Could not find service with id: ' + serviceId));
+            throw _makeError('Failed to get characteristics', `Could not find service with Id: ${serviceId}.`);
         }
 
-        const device = this.getDevice(service.deviceInstanceId);
+        const device = this._getDeviceByIdAndPropagateError(service.deviceInstanceId,
+                                                            'Failed to get characteristics.', callback);
+        if (!device) {
+            return;
+        }
 
         if (this._gattOperationsMap[device.instanceId]) {
-            this._checkAndPropagateError(undefined, 'Failed to get characteristics, a gatt operation already in progress', callback);
+            this._checkAndPropagateError('Failed to get characteristics',
+                                         'A GATT operation already in progress', callback);
             return;
         }
 
@@ -2471,28 +2957,29 @@ class Adapter extends EventEmitter {
         });
 
         if (!_.isEmpty(alreadyFoundCharacteristics)) {
-            if (callback) { callback(undefined, alreadyFoundCharacteristics); }
+            if (_isCallback(callback)) {
+                callback(undefined, alreadyFoundCharacteristics);
+            }
             return;
         }
 
         const handleRange = {
             start_handle: service.startHandle,
-            end_handle: service.endHandle
+            end_handle: service.endHandle,
         };
 
-        this._gattOperationsMap[device.instanceId] = {
-            callback: callback,
-            pendingHandleReads: {},
-            parent: service
-        };
-
+        this._gattOperationsMap[device.instanceId] = { callback, pendingHandleReads: {}, parent: service };
         this._adapter.gattcDiscoverCharacteristics(device.connectionHandle, handleRange, err => {
-            if (this._checkAndPropagateError(err, 'Failed to get Characteristics', callback)) {
-                return;
-            }
+            this._checkAndPropagateError(err, 'Failed to get Characteristics', callback);
         });
     }
 
+    /**
+     * Get a `Descriptor` instance by its instanceId.
+     *
+     * @param {string} descriptorId The unique Id of this descriptor.
+     * @returns {Descriptor} The descriptor.
+     */
     getDescriptor(descriptorId) {
         return this._descriptors[descriptorId];
     }
@@ -2519,22 +3006,28 @@ class Adapter extends EventEmitter {
 
     _addDeviceToAllPerConnectionValues(deviceId) {
         for (const descriptorInstanceId in this._descriptors) {
-            const descriptor = this._descriptors[descriptorInstanceId];
-            if (this._instanceIdIsOnLocalDevice(descriptorInstanceId) &&
-                this._isDescriptorPerConnectionBased(descriptor)) {
-                this._setDescriptorValue(descriptor, [0, 0], deviceId);
-                this.emit('descriptorValueChanged', descriptor);
+            if (Object.prototype.hasOwnProperty.call(this._descriptors, descriptorInstanceId) ||
+                {}.hasOwnProperty.call(this._descriptors, descriptorInstanceId)) {
+                const descriptor = this._descriptors[descriptorInstanceId];
+                if (this._instanceIdIsOnLocalDevice(descriptorInstanceId) &&
+                    this._isDescriptorPerConnectionBased(descriptor)) {
+                    this._setDescriptorValue(descriptor, [0, 0], deviceId);
+                    this.emit('descriptorValueChanged', descriptor);
+                }
             }
         }
     }
 
     _clearDeviceFromAllPerConnectionValues(deviceId) {
         for (const descriptorInstanceId in this._descriptors) {
-            const descriptor = this._descriptors[descriptorInstanceId];
-            if (this._instanceIdIsOnLocalDevice(descriptorInstanceId) &&
-                this._isDescriptorPerConnectionBased(descriptor)) {
-                delete descriptor.value[deviceId];
-                this.emit('descriptorValueChanged', descriptor);
+            if (Object.prototype.hasOwnProperty.call(this._descriptors, descriptorInstanceId) ||
+                {}.hasOwnProperty.call(this._descriptors, descriptorInstanceId)) {
+                const descriptor = this._descriptors[descriptorInstanceId];
+                if (this._instanceIdIsOnLocalDevice(descriptorInstanceId) &&
+                    this._isDescriptorPerConnectionBased(descriptor)) {
+                    delete descriptor.value[deviceId];
+                    this.emit('descriptorValueChanged', descriptor);
+                }
             }
         }
     }
@@ -2548,7 +3041,7 @@ class Adapter extends EventEmitter {
     _filterObject(collection, predicate) {
         const newCollection = {};
 
-        for (let key in collection) {
+        for (const key in collection) {
             if (predicate(key)) {
                 newCollection[key] = collection[key];
             }
@@ -2557,13 +3050,26 @@ class Adapter extends EventEmitter {
         return newCollection;
     }
 
+    /**
+     * Initiate or continue a GATT Characteristic Descriptor Discovery procedure.
+     *
+     * @param {string} characteristicId Unique ID of of the GATT characteristic.
+     * @param {function} callback Callback signature: (err, descriptors) => {}.
+     * @returns {void}
+     */
     getDescriptors(characteristicId, callback) {
         const characteristic = this.getCharacteristic(characteristicId);
         const service = this.getService(characteristic.serviceInstanceId);
-        const device = this.getDevice(service.deviceInstanceId);
+
+        const device = this._getDeviceByIdAndPropagateError(service.deviceInstanceId,
+            'Failed to get descriptors.', callback);
+        if (!device) {
+            return;
+        }
 
         if (this._gattOperationsMap[device.instanceId]) {
-            this.emit('error', _makeError('Failed to get descriptors, a gatt operation already in progress', undefined));
+            this._checkAndPropagateError('Failed to get descriptors',
+                                         'A GATT operation already in progress', callback);
             return;
         }
 
@@ -2572,14 +3078,19 @@ class Adapter extends EventEmitter {
         });
 
         if (!_.isEmpty(alreadyFoundDescriptor)) {
-            if (callback) { callback(undefined, alreadyFoundDescriptor); }
+            if (_isCallback(callback)) {
+                callback(undefined, alreadyFoundDescriptor);
+            }
             return;
         }
 
         const handleRange = { start_handle: characteristic.valueHandle + 1, end_handle: service.endHandle };
         this._gattOperationsMap[device.instanceId] = { callback, pendingHandleReads: {}, parent: characteristic };
         this._adapter.gattcDiscoverDescriptors(device.connectionHandle, handleRange, err => {
-            //this._checkAndPropagateError('Failed to get descriptors', err, callback);
+            if (_isCallback(callback)) {
+                callback(err);
+            }
+            // this._checkAndPropagateError('Failed to get descriptors', err, callback);
         });
     }
 
@@ -2589,12 +3100,10 @@ class Adapter extends EventEmitter {
                 this.getDescriptors(
                     characteristicId, (error, descriptors) => {
                         if (error) {
-                            reject(error);
-                            return;
+                            return reject(error);
                         }
 
                         data.services[serviceId].characteristics[characteristicId].descriptors = descriptors;
-
                         resolve(data);
                     }
                 );
@@ -2607,14 +3116,13 @@ class Adapter extends EventEmitter {
             return new Promise((resolve, reject) => {
                 this.getCharacteristics(service.instanceId, (error, characteristics) => {
                     if (error) {
-                        reject(error);
-                        return;
+                        return reject(error);
                     }
 
                     data.services[service.instanceId].characteristics = {};
                     let promise = Promise.resolve(data);
 
-                    for (let characteristic of characteristics) {
+                    for (const characteristic of characteristics) {
                         data.services[service.instanceId].characteristics[characteristic.instanceId] = characteristic;
 
                         promise = promise.then(data => {
@@ -2641,8 +3149,7 @@ class Adapter extends EventEmitter {
                 deviceInstanceId,
                 (error, services) => {
                     if (error) {
-                        reject(error);
-                        return;
+                        return reject(error);
                     }
 
                     resolve(services);
@@ -2650,31 +3157,54 @@ class Adapter extends EventEmitter {
         });
     }
 
+    /**
+     * Discovers information about a range of attributes on a GATT server.
+     *
+     * @param {string} deviceInstanceId The device's unique Id.
+     * @param {function} callback Callback signature: (err, attributes) => {}.
+     * @returns {void}
+     */
     getAttributes(deviceInstanceId, callback) {
-        let data = { 'services': {} };
+        const data = { services: {} };
 
         this._getServicesPromise(deviceInstanceId).then(services => {
             let p = Promise.resolve(data);
 
-            for (let service of services) {
+            for (const service of services) {
                 data.services[service.instanceId] = service;
 
-                p = p.then(data => {
-                    return this._getCharacteristicsPromise()(data, service);
+                p = p.then(_data => {
+                    return this._getCharacteristicsPromise()(_data, service);
                 });
             }
 
             return p;
         })
-            .then(data => { if (callback) callback(undefined, data); })
-            .catch(error => { if (callback) callback(error); });
+        // TODO: no descriptors?
+        .then(_data => {
+            if (_isCallback(callback)) {
+                callback(undefined, _data);
+            }
+        })
+        .catch(error => {
+            if (_isCallback(callback)) {
+                callback(error);
+            }
+        });
     }
 
-    // Callback signature function(err, readBytes) {}
+    /**
+     * Reads the value of a GATT characteristic.
+     *
+     * @param {string} characteristicId Unique ID of of the GATT characteristic.
+     * @param {function} callback Callback signature: (err, readBytes) => {}.
+     * @returns {void}
+     */
     readCharacteristicValue(characteristicId, callback) {
         const characteristic = this.getCharacteristic(characteristicId);
         if (!characteristic) {
-            throw new Error('Characteristic value read failed: Could not get characteristic with id ' + characteristicId);
+            throw new Error(`Characteristic write failed: 
+                             Could not get the characteristic with Id: ${characteristicId}.`);
         }
 
         if (this._instanceIdIsOnLocalDevice(characteristicId)) {
@@ -2684,27 +3214,38 @@ class Adapter extends EventEmitter {
 
         const device = this._getDeviceByCharacteristicId(characteristicId);
         if (!device) {
-            throw new Error('Characteristic value read failed: Could not get device');
+            throw new Error('Characteristic write failed: Could not get device.');
         }
 
         if (this._gattOperationsMap[device.instanceId]) {
-            throw new Error('Characteristic value read failed: A gatt operation already in progress with device id ' + device.instanceId);
+            throw new Error(`Characteristic read failed:
+                             A GATT operation is already in progress with device with Id: ${device.instanceId}.`);
         }
 
-        this._gattOperationsMap[device.instanceId] = { callback: callback, readBytes: [] };
+        this._gattOperationsMap[device.instanceId] = { callback, readBytes: [] };
 
         this._adapter.gattcRead(device.connectionHandle, characteristic.valueHandle, 0, err => {
             if (err) {
-                this.emit('error', _makeError('Read characteristic value failed', err));
+                this.emit('error', _makeError('Characteristic read failed', err));
             }
         });
     }
 
-    // Callback signature function(err) {}  ack: require acknowledge from device, irrelevant in GATTS role.
+    /**
+     * Writes the value of a GATT characteristic.
+     *
+     * @param {string} characteristicId Unique ID of the GATT characteristic.
+     * @param {array} value The value (array of bytes) to be written.
+     * @param {boolean} ack Require acknowledge from device, irrelevant in GATTS role.
+     * @param {function} completeCallback Callback signature: err => {}
+     * @param {function} deviceNotifiedOrIndicated TODO
+     * @returns {void}
+     */
     writeCharacteristicValue(characteristicId, value, ack, completeCallback, deviceNotifiedOrIndicated) {
         const characteristic = this.getCharacteristic(characteristicId);
         if (!characteristic) {
-            throw new Error('Characteristic value write failed: Could not get characteristic with id ' + characteristicId);
+            throw new Error(`Characteristic write failed: 
+                             Could not get the characteristic with Id: ${characteristicId}.`);
         }
 
         if (this._instanceIdIsOnLocalDevice(characteristicId)) {
@@ -2714,18 +3255,24 @@ class Adapter extends EventEmitter {
 
         const device = this._getDeviceByCharacteristicId(characteristicId);
         if (!device) {
-            throw new Error('Characteristic value write failed: Could not get device');
+            throw new Error('Characteristic write failed: Could not get device.');
         }
 
         if (this._gattOperationsMap[device.instanceId]) {
-            throw new Error('Characteristic value write failed: A gatt operation already in progress with device id ' + device.instanceId);
+            throw new Error(`Characteristic write failed:
+                             A GATT operation is already in progress with device with Id: ${device.instanceId}.`);
         }
 
-        this._gattOperationsMap[device.instanceId] = { callback: completeCallback, bytesWritten: 0, value: value.slice(), attribute: characteristic };
+        this._gattOperationsMap[device.instanceId] = {
+            callback: completeCallback,
+            bytesWritten: 0,
+            value: value.slice(),
+            attribute: characteristic,
+        };
 
         if (value.length > this._maxShortWritePayloadSize(device.instanceId)) {
             if (!ack) {
-                throw new Error('Long writes do not support BLE_GATT_OP_WRITE_CMD');
+                throw new Error('Long writes do not support BLE_GATT_OP_WRITE_CMD.');
             }
 
             this._gattOperationsMap[device.instanceId].bytesWritten = this._maxLongWritePayloadSize(device.instanceId);
@@ -2739,7 +3286,7 @@ class Adapter extends EventEmitter {
     _getDeviceByDescriptorId(descriptorId) {
         const descriptor = this._descriptors[descriptorId];
         if (!descriptor) {
-            throw new Error('No descriptor found with descriptor id: ' + descriptorId);
+            throw new Error(`No descriptor found with Id: ${descriptorId}.`);
         }
 
         return this._getDeviceByCharacteristicId(descriptor.characteristicInstanceId);
@@ -2748,17 +3295,17 @@ class Adapter extends EventEmitter {
     _getDeviceByCharacteristicId(characteristicId) {
         const characteristic = this._characteristics[characteristicId];
         if (!characteristic) {
-            throw new Error('No characteristic found with id: ' + characteristicId);
+            throw new Error(`No characteristic found with Id: ${characteristicId}.`);
         }
 
         const service = this._services[characteristic.serviceInstanceId];
         if (!service) {
-            throw new Error('No service found with id: ' + characteristic.serviceInstanceId);
+            throw new Error(`No service found with Id: ${characteristic.serviceInstanceId}.`);
         }
 
         const device = this._devices[service.deviceInstanceId];
         if (!device) {
-            throw new Error('No device found with id: ' + service.deviceInstanceId);
+            throw new Error(`No device found with id: ${service.deviceInstanceId}.`);
         }
 
         return device;
@@ -2766,15 +3313,13 @@ class Adapter extends EventEmitter {
 
     _isCCCDDescriptor(descriptorId) {
         const descriptor = this._descriptors[descriptorId];
-        return descriptor &&
-            ((descriptor.uuid === '0000290200001000800000805F9B34FB') ||
-                (descriptor.uuid === '2902'));
+        return descriptor && (descriptor.uuid === '0000290200001000800000805F9B34FB' || descriptor.uuid === '2902');
     }
 
     _getCCCDOfCharacteristic(characteristicId) {
         return _.find(this._descriptors, descriptor => {
-            return (descriptor.characteristicInstanceId === characteristicId) &&
-                (this._isCCCDDescriptor(descriptor.instanceId));
+            return descriptor.characteristicInstanceId === characteristicId &&
+                this._isCCCDDescriptor(descriptor.instanceId);
         });
     }
 
@@ -2782,10 +3327,17 @@ class Adapter extends EventEmitter {
         return instanceId.split('.')[0] === 'local';
     }
 
+    /**
+     * Reads the value of a GATT descriptor.
+     *
+     * @param {string} descriptorId Unique ID of of the GATT descriptor.
+     * @param {function} callback Callback signature: (err, readBytes) => {}.
+     * @returns {void}
+     */
     readDescriptorValue(descriptorId, callback) {
         const descriptor = this.getDescriptor(descriptorId);
         if (!descriptor) {
-            throw new Error('Descriptor read failed: could not get descriptor with id ' + descriptorId);
+            throw new Error(`Descriptor read failed: Could not get the descriptor with Id: ${descriptorId}.`);
         }
 
         if (this._instanceIdIsOnLocalDevice(descriptorId)) {
@@ -2795,14 +3347,15 @@ class Adapter extends EventEmitter {
 
         const device = this._getDeviceByDescriptorId(descriptorId);
         if (!device) {
-            throw new Error('Descriptor read failed: Could not get device');
+            throw new Error('Descriptor read failed: Could not get device.');
         }
 
         if (this._gattOperationsMap[device.instanceId]) {
-            throw new Error('Descriptor read failed: A gatt operation already in progress with device with id ' + device.instanceId);
+            throw new Error(`Descriptor read failed:
+                             A GATT operation is already in progress with device with Id: ${device.instanceId}.`);
         }
 
-        this._gattOperationsMap[device.instanceId] = { callback: callback, readBytes: [] };
+        this._gattOperationsMap[device.instanceId] = { callback, readBytes: [] };
 
         this._adapter.gattcRead(device.connectionHandle, descriptor.handle, 0, err => {
             if (err) {
@@ -2811,12 +3364,21 @@ class Adapter extends EventEmitter {
         });
     }
 
-    // Callback signature function(err) {}, callback will not be called until ack is received. options: {ack, long, offset}
+    /**
+     * Writes the value of a GATT descriptor.
+     *
+     * @param {string} descriptorId Unique ID of the GATT descriptor.
+     * @param {array} value The value (array of bytes) to be written.
+     * @param {boolean} ack Require acknowledge from device, irrelevant in GATTS role.
+     * @param {function} callback Callback signature: err => {}. (not called until ack is received if `requireAck`).
+     *                            options: {ack, long, offset}
+     * @returns {void}
+     */
     writeDescriptorValue(descriptorId, value, ack, callback) {
         // Does not support reliable write
         const descriptor = this.getDescriptor(descriptorId);
         if (!descriptor) {
-            throw new Error('Descriptor write failed: could not get descriptor with id ' + descriptorId);
+            throw new Error(`Descriptor write failed: Could not get the descriptor with Id: ${descriptorId}.`);
         }
 
         if (this._instanceIdIsOnLocalDevice(descriptorId)) {
@@ -2826,18 +3388,24 @@ class Adapter extends EventEmitter {
 
         const device = this._getDeviceByDescriptorId(descriptorId);
         if (!device) {
-            throw new Error('Descriptor write failed: Could not get device');
+            throw new Error('Descriptor write failed: Could not get device.');
         }
 
         if (this._gattOperationsMap[device.instanceId]) {
-            throw new Error('Descriptor write failed: A gatt operation already in progress with device with id ' + device.instanceId);
+            throw new Error(`Descriptor write failed:
+                             A GATT operation is already in progress with device with Id: ${device.instanceId}.`);
         }
 
-        this._gattOperationsMap[device.instanceId] = { callback: callback, bytesWritten: 0, value: value.slice(), attribute: descriptor };
+        this._gattOperationsMap[device.instanceId] = {
+            callback,
+            bytesWritten: 0,
+            value: value.slice(),
+            attribute: descriptor,
+        };
 
         if (value.length > this._maxShortWritePayloadSize(device.instanceId)) {
             if (!ack) {
-                throw new Error('Long writes do not support BLE_GATT_OP_WRITE_CMD');
+                throw new Error('Long writes do not support BLE_GATT_OP_WRITE_CMD.');
             }
 
             this._gattOperationsMap[device.instanceId].bytesWritten = this._maxLongWritePayloadSize(device.instanceId);
@@ -2851,53 +3419,67 @@ class Adapter extends EventEmitter {
     _shortWrite(device, attribute, value, ack, callback) {
         const writeParameters = {
             write_op: ack ? this._bleDriver.BLE_GATT_OP_WRITE_REQ : this._bleDriver.BLE_GATT_OP_WRITE_CMD,
-            flags: 0, // don't care for WRITE_REQ / WRITE_CMD
+            flags: 0, // don't care for WRITE_REQ/WRITE_CMD
             handle: attribute.handle,
             offset: 0,
             len: value.length,
-            value: value,
+            value,
         };
 
         this._gattcWriteWithRetries(device.connectionHandle, writeParameters, err => {
             if (err) {
                 delete this._gattOperationsMap[device.instanceId];
-                this.emit('error', _makeError('Failed to write to attribute with handle: ' + attribute.handle, err));
-                if (callback) callback(err);
+
+                this.emit('error', _makeError(`Failed to write attribute with handle: ${attribute.handle}`, err));
+                if (_isCallback(callback)) {
+                    callback(err);
+                }
+
                 return;
             }
 
             if (!ack) {
                 delete this._gattOperationsMap[device.instanceId];
+
                 attribute.value = value;
-                if (callback) { callback(undefined, attribute); }
+
+                if (_isCallback(callback)) {
+                    callback(undefined, attribute);
+                }
             }
         });
     }
 
     _gattcWriteWithRetries(connectionHandle, writeParameters, callback) {
         let attempts = 0;
+
         const MAX_ATTEMPTS = 20;
         const RETRY_DELAY = 5;
         const BLE_ERROR_NO_TX_PACKETS = 0x3004;
+
         const tryWrite = () => {
             this._adapter.gattcWrite(connectionHandle, writeParameters, err => {
                 if (err) {
-                    if (err.errno === BLE_ERROR_NO_TX_PACKETS && attempts++ <= MAX_ATTEMPTS) {
+                    attempts += 1;
+
+                    if (err.errno === BLE_ERROR_NO_TX_PACKETS && attempts <= MAX_ATTEMPTS) {
                         setTimeout(() => tryWrite(), RETRY_DELAY);
-                    } else {
-                        if (callback) callback(err);
+                    } else if (_isCallback(callback)) {
+                        callback(err);
                     }
-                } else {
-                    if (callback) callback();
+                } else if (_isCallback(callback)) {
+                    callback();
                 }
             });
         };
+
         tryWrite();
     }
 
     _longWrite(device, attribute, value, callback) {
         if (value.length < this._maxShortWritePayloadSize(device.instanceId)) {
-            throw new Error('Wrong write method. Use regular write for payload sizes < ' + this._maxShortWritePayloadSize(device.instanceId));
+            throw new Error(`Wrong write method. Use regular write for payload sizes < 
+                            ${this._maxShortWritePayloadSize(device.instanceId)}.`);
         }
 
         const writeParameters = {
@@ -2911,12 +3493,14 @@ class Adapter extends EventEmitter {
 
         this._adapter.gattcWrite(device.connectionHandle, writeParameters, err => {
             if (err) {
-                console.log(err);
                 this._longWriteCancel(device, attribute);
-                this.emit('error', _makeError('Failed to write value to device/handle ' + device.instanceId + '/' + attribute.handle, err));
-                return;
-            }
 
+                this.emit('error', _makeError(`Failed to long write value of device/handle: 
+                                               ${device.instanceId}/'${attribute.handle}.`, err));
+                if (_isCallback(callback)) {
+                    callback(err);
+                }
+            }
         });
     }
 
@@ -2935,10 +3519,11 @@ class Adapter extends EventEmitter {
             delete this._gattOperationsMap[device.instanceId];
 
             if (err) {
-                this.emit('error', _makeError('Failed to cancel failed long write', err));
-                gattOperation.callback('Failed to write and failed to cancel write');
+                this.emit('error', _makeError('Failed to cancel failed long write.', err));
+                gattOperation.callback('Failed to write and failed to cancel the failed long write.');
             } else {
-                gattOperation.callback('Failed to write value to device/handle ' + device.instanceId + '/' + attribute.handle);
+                gattOperation.callback(`Failed to long write value of device/handle: 
+                                        ${device.instanceId}/${attribute.handle}.`);
             }
         });
     }
@@ -2950,11 +3535,7 @@ class Adapter extends EventEmitter {
     }
 
     _writeLocalValue(attribute, value, offset, completeCallback, deviceNotifiedOrIndicated) {
-        const writeParameters = {
-            len: value.length,
-            offset: offset,
-            value: value,
-        };
+        const writeParameters = { len: value.length, offset, value };
 
         if (!this._instanceIdIsOnLocalDevice(attribute.instanceId)) {
             this.emit('error', _makeError('Attribute was not a local attribute'));
@@ -3016,64 +3597,67 @@ class Adapter extends EventEmitter {
                 remainingIndicationConfirmations: 0,
             };
 
-            for (let deviceInstanceId in this._devices) {
-                const cccdValue = cccdDescriptor.value[deviceInstanceId][0];
-                const sendIndication = cccdValue & 2;
-                const sendNotification = !sendIndication && (cccdValue & 1);
+            for (const deviceInstanceId in this._devices) {
+                if (Object.prototype.hasOwnProperty.call(this._devices, deviceInstanceId) ||
+                    {}.hasOwnProperty.call(this._devices, deviceInstanceId)) {
+                    const cccdValue = cccdDescriptor.value[deviceInstanceId][0];
+                    const sendIndication = cccdValue & 2;
+                    const sendNotification = !sendIndication && (cccdValue & 1);
 
-                if (sendNotification || sendIndication) {
-                    const device = this._devices[deviceInstanceId];
-                    const hvxParams = {
-                        handle: attribute.valueHandle,
-                        type: sendIndication || sendNotification,
-                        offset: offset,
-                        len: value.length,
-                        data: value,
-                    };
-                    sentHvx = true;
-
-                    if (sendNotification) {
-                        this._pendingNotificationsAndIndications.remainingNotificationCallbacks++;
-                    } else if (sendIndication) {
-                        this._pendingNotificationsAndIndications.remainingIndicationConfirmations++;
-                    }
-
-                    this._adapter.gattsHVX(device.connectionHandle, hvxParams, err => {
-                        if (err) {
-                            if (sendNotification) {
-                                this._pendingNotificationsAndIndications.remainingNotificationCallbacks--;
-                            } else if (sendIndication) {
-                                this._pendingNotificationsAndIndications.remainingIndicationConfirmations--;
-                            }
-
-                            this.emit('error', _makeError('Failed to send notification', err));
-
-                            if (this._sendingNotificationsAndIndicationsComplete()) {
-                                completeCallback(_makeError('Failed to send notification or indication', err));
-                                this._pendingNotificationsAndIndications = {};
-                            }
-
-                            return;
-                        }
-
-                        this._setAttributeValueWithOffset(attribute, value, offset);
+                    if (sendNotification || sendIndication) {
+                        const device = this._devices[deviceInstanceId];
+                        const hvxParams = {
+                            handle: attribute.valueHandle,
+                            type: sendIndication || sendNotification,
+                            offset,
+                            len: value.length,
+                            data: value,
+                        };
+                        sentHvx = true;
 
                         if (sendNotification) {
-                            if (deviceNotifiedOrIndicated) {
-                                deviceNotifiedOrIndicated(device, attribute);
-                            }
-
-                            this.emit('deviceNotifiedOrIndicated', device, attribute);
-
-                            this._pendingNotificationsAndIndications.remainingNotificationCallbacks--;
-                            if (this._sendingNotificationsAndIndicationsComplete()) {
-                                completeCallback(undefined);
-                                this._pendingNotificationsAndIndications = {};
-                            }
+                            this._pendingNotificationsAndIndications.remainingNotificationCallbacks += 1;
                         } else if (sendIndication) {
-                            return;
+                            this._pendingNotificationsAndIndications.remainingIndicationConfirmations += 1;
                         }
-                    });
+
+                        this._adapter.gattsHVX(device.connectionHandle, hvxParams, err => {
+                            if (err) {
+                                if (sendNotification) {
+                                    this._pendingNotificationsAndIndications.remainingNotificationCallbacks -= 1;
+                                } else if (sendIndication) {
+                                    this._pendingNotificationsAndIndications.remainingIndicationConfirmations -= 1;
+                                }
+
+                                this.emit('error', _makeError('Failed to send notification', err));
+
+                                if (this._sendingNotificationsAndIndicationsComplete()) {
+                                    completeCallback(_makeError('Failed to send notification or indication', err));
+                                    this._pendingNotificationsAndIndications = {};
+                                }
+
+                                return;
+                            }
+
+                            this._setAttributeValueWithOffset(attribute, value, offset);
+
+                            if (sendNotification) {
+                                if (deviceNotifiedOrIndicated) {
+                                    deviceNotifiedOrIndicated(device, attribute);
+                                }
+
+                                this.emit('deviceNotifiedOrIndicated', device, attribute);
+
+                                this._pendingNotificationsAndIndications.remainingNotificationCallbacks -= 1;
+                                if (this._sendingNotificationsAndIndicationsComplete()) {
+                                    completeCallback(undefined);
+                                    this._pendingNotificationsAndIndications = {};
+                                }
+                            } else if (sendIndication) {
+                                return;
+                            }
+                        });
+                    }
                 }
             }
 
@@ -3089,7 +3673,7 @@ class Adapter extends EventEmitter {
             return;
         }
 
-        this._adapter.gattsSetValue(this._bleDriver.BLE_CONN_HANDLE_INVALID, attribute.handle, writeParameters, (err, writeResult) => {
+        this._adapter.gattsSetValue(this._bleDriver.BLE_CONN_HANDLE_INVALID, attribute.handle, writeParameters, err => {
             if (err) {
                 this.emit('error', _makeError('Failed to write local value', err));
                 completeCallback(err, undefined);
@@ -3108,63 +3692,93 @@ class Adapter extends EventEmitter {
             value: [],
         };
 
-        this._adapter.gattsGetValue(this._bleDriver.BLE_CONN_HANDLE_INVALID, attribute, readParameters, (err, readResults) => {
-            if (err) {
-                this.emit('error', _makeError('Failed to write local value', err));
-                if (callback) callback(err, undefined);
-                return;
-            }
+        this._adapter.gattsGetValue(this._bleDriver.BLE_CONN_HANDLE_INVALID, attribute, readParameters,
+            (err, readResults) => {
+                if (err) {
+                    this.emit('error', _makeError('Failed to write local value', err));
 
-            attribute.value = readResults.value;
-            if (callback) { callback(undefined, attribute); }
-        });
+                    if (_isCallback(callback)) {
+                        callback(err, undefined);
+                    }
+
+                    return;
+                }
+
+                attribute.value = readResults.value;
+                if (_isCallback(callback)) {
+                    callback(undefined, attribute);
+                }
+            }
+        );
     }
 
-    // Only for GATTC role
-
-    // Callback signature function(err) {}, ack: require all notifications to ack, callback will not be called until ack is received
+    /**
+     * Starts notifications on a GATT characteristic.
+     *
+     * Only for GATT central role.
+     *
+     * @param {string} characteristicId Unique ID of the GATT characteristic.
+     * @param {boolean} requireAck Require all notifications to ack.
+     * @param {function} callback Callback signature: err => {} (not called until ack is received if `requireAck`).
+     * @returns {void}
+     */
     startCharacteristicsNotifications(characteristicId, requireAck, callback) {
-        // TODO: If CCCD not discovered do a decriptor discovery
-        const enableNotificationBitfield = requireAck ? 2 : 1;
+        const enableNotificationsBitfield = requireAck ? 2 : 1;
+
         const characteristic = this._characteristics[characteristicId];
         if (!characteristic) {
-            throw new Error('Start characteristic notifications failed: Could not get characteristic with id ' + characteristicId);
+            throw new Error(`Disabling characteristic's notifications failed: 
+                             Could not get the characteristic with Id: ${characteristicId}.`);
         }
 
         const cccdDescriptor = this._getCCCDOfCharacteristic(characteristicId);
+        // TODO: If CCCD has not been discovered do a descriptor discovery
         if (!cccdDescriptor) {
-            throw new Error('Start characteristic notifications failed: Could not find CCCD descriptor with parent characteristic id: ' + characteristicId);
+            throw new Error(`Disabling characteristic's notifications failed:
+                             Could not find the CCCD with parent characteristic Id: ${characteristicId}.`);
         }
 
-        this.writeDescriptorValue(cccdDescriptor.instanceId, [enableNotificationBitfield, 0], true, err => {
+        this.writeDescriptorValue(cccdDescriptor.instanceId, [enableNotificationsBitfield, 0], true, err => {
             if (err) {
-                this.emit('error', 'Failed to start characteristics notifications');
+                this.emit('error', 'Failed to start characteristic\'s notifications');
             }
 
-            if (callback) { callback(err); }
+            if (_isCallback(callback)) {
+                callback(err);
+            }
         });
     }
 
-    // Callback signature function(err) {}
+    /**
+     * Disables notifications on a GATT characteristic.
+     *
+     * @param {string} characteristicId Unique ID of the GATT characteristic.
+     * @param {function} callback Callback signature: err => {}.
+     * @returns {void}
+     */
     stopCharacteristicsNotifications(characteristicId, callback) {
-        // TODO: If CCCD not discovered how did we start it?
-        const disableNotificationBitfield = 0;
+        const disableNotificationsBitfield = 0;
+
         const characteristic = this._characteristics[characteristicId];
         if (!characteristic) {
-            throw new Error('Stop characteristic notifications failed: Could not get characteristic with id ' + characteristicId);
+            throw new Error(`Disabling characteristic's notifications failed: 
+                             Could not get the characteristic with Id: ${characteristicId}.`);
         }
 
         const cccdDescriptor = this._getCCCDOfCharacteristic(characteristicId);
         if (!cccdDescriptor) {
-            throw new Error('Stop characteristic notifications failed: Could not find CCCD descriptor with parent characteristic id: ' + characteristicId);
+            throw new Error(`Disabling characteristic's notifications failed:
+                             Could not find the CCCD with parent characteristic Id: ${characteristicId}.`);
         }
 
-        this.writeDescriptorValue(cccdDescriptor.instanceId, [disableNotificationBitfield, 0], true, err => {
+        this.writeDescriptorValue(cccdDescriptor.instanceId, [disableNotificationsBitfield, 0], true, err => {
             if (err) {
-                this.emit('error', 'Failed to stop characteristics notifications');
+                this.emit('error', 'Failed to stop characteristic\'s notifications');
             }
 
-            if (callback) { callback(err); }
+            if (_isCallback(callback)) {
+                callback(err);
+            }
         });
     }
 }

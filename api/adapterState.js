@@ -49,7 +49,7 @@ class AdapterState {
      * @constructor
      * @param {string} instanceId The unique Id of this adapter.
      * @param {string} port The port this adapter uses. For example it can be 'COM1', '/dev/ttyUSB0' or similar.
-     * @param {Number} serialNumber The serial number of the hardware device being controlled by this adapter.
+     * @param {string} serialNumber The serial number of the hardware device being controlled by this adapter.
      */
     constructor(instanceId, port, serialNumber) {
         this._instanceId = `${instanceId}.${port}`;
